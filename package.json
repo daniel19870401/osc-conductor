@@ -1,0 +1,65 @@
+{
+  "name": "osc-daw",
+  "version": "0.1.0",
+  "description": "OSC DAW UI prototype with Electron + React + SVG",
+  "main": "electron/main.js",
+  "type": "commonjs",
+  "private": true,
+  "scripts": {
+    "dev": "concurrently -k \"vite\" \"wait-on tcp:5170 && electron .\"",
+    "build": "vite build",
+    "preview": "vite preview",
+    "start": "electron .",
+    "pack:mac": "npm run build && electron-builder --mac dir --arm64 --config.mac.identity=null",
+    "pack:win": "npm run build && electron-builder --win portable --x64 --config.win.signAndEditExecutable=false",
+    "pack:win:dir": "npm run build && electron-builder --win dir --x64 --config.win.signAndEditExecutable=false"
+  },
+  "dependencies": {
+    "@julusian/midi": "^3.6.1",
+    "linear-timecode": "^0.1.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.1",
+    "concurrently": "^9.1.0",
+    "electron": "^31.6.0",
+    "electron-builder": "^26.7.0",
+    "electron-packager": "^17.1.2",
+    "vite": "^5.4.2",
+    "wait-on": "^7.2.0"
+  },
+  "build": {
+    "appId": "com.oscdaw.app",
+    "productName": "OSCDAW",
+    "asar": true,
+    "npmRebuild": false,
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "build/icons/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "dir",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icons/icon.ico",
+      "signAndEditExecutable": false
+    },
+    "mac": {
+      "target": [
+        "dir"
+      ],
+      "icon": "build/icons/icon.icns"
+    }
+  }
+}

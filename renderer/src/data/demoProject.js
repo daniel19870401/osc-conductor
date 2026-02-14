@@ -1,0 +1,67 @@
+export const demoProject = {
+  name: 'Untitled',
+  timebase: {
+    bpm: 120,
+    fps: 30,
+    timeSignature: [4, 4],
+    unit: 'seconds',
+    sync: 'Internal',
+  },
+  osc: {
+    host: '127.0.0.1',
+    port: 9000,
+  },
+  view: {
+    start: 0,
+    end: 8,
+    length: 120,
+    trackHeight: 96,
+  },
+  cues: [],
+  tracks: [
+    {
+      id: 'track-1',
+      name: 'Dynamics',
+      min: 0,
+      max: 1,
+      default: 0.2,
+      oscAddress: '/track/1/value',
+      nodes: [
+        { id: 't1-n1', t: 0.0, v: 0.15, curve: 'linear' },
+        { id: 't1-n2', t: 1.6, v: 0.78, curve: 'linear' },
+        { id: 't1-n3', t: 3.2, v: 0.35, curve: 'linear' },
+        { id: 't1-n4', t: 5.4, v: 0.9, curve: 'linear' },
+        { id: 't1-n5', t: 7.4, v: 0.4, curve: 'linear' },
+      ],
+    },
+    {
+      id: 'track-2',
+      name: 'Texture',
+      min: -1,
+      max: 1,
+      default: 0,
+      oscAddress: '/track/2/value',
+      nodes: [
+        { id: 't2-n1', t: 0.2, v: -0.6, curve: 'linear' },
+        { id: 't2-n2', t: 2.1, v: 0.2, curve: 'linear' },
+        { id: 't2-n3', t: 4.0, v: -0.1, curve: 'linear' },
+        { id: 't2-n4', t: 6.8, v: 0.7, curve: 'linear' },
+      ],
+    },
+    {
+      id: 'track-3',
+      name: 'Brightness',
+      min: 0,
+      max: 127,
+      default: 64,
+      oscAddress: '/track/3/value',
+      nodes: [
+        { id: 't3-n1', t: 0.0, v: 20, curve: 'linear' },
+        { id: 't3-n2', t: 1.4, v: 90, curve: 'linear' },
+        { id: 't3-n3', t: 2.6, v: 40, curve: 'linear' },
+        { id: 't3-n4', t: 4.6, v: 120, curve: 'linear' },
+        { id: 't3-n5', t: 7.6, v: 70, curve: 'linear' },
+      ],
+    },
+  ],
+};
