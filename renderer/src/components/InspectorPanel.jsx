@@ -10,6 +10,7 @@ export default function InspectorPanel({
   onPatch,
   onAddNode,
   onAudioFile,
+  onOpenAudioChannelMap,
   onNameEnterNext,
   nameFocusToken,
   midiOutputOptions = [],
@@ -108,24 +109,38 @@ export default function InspectorPanel({
               <span>Loaded</span>
               <span className="inspector__value">{track.audio?.name || 'None'}</span>
             </div>
-              <div className="field">
-                <label>Volume</label>
-                <input
-                  className="input"
-                  type="range"
-                  min="0"
-                  max="1"
-                  step="0.01"
-                  value={Number.isFinite(track.audio?.volume) ? track.audio.volume : 1}
-                  onChange={(event) =>
-                    onPatch({
+            <div className="field">
+              <label>Volume</label>
+              <input
+                className="input"
+                type="range"
+                min="0"
+                max="1"
+                step="0.01"
+                value={Number.isFinite(track.audio?.volume) ? track.audio.volume : 1}
+                onChange={(event) =>
+                  onPatch({
                     audio: { volume: parseNumber(event.target.value, 1) },
-                  })
-                }
+                  })}
               />
               <div className="field__hint">
                 {Number(Number.isFinite(track.audio?.volume) ? track.audio.volume : 1).toFixed(2)}
               </div>
+            </div>
+            <div className="inspector__buttons">
+              <button
+                className="btn btn--ghost"
+                onClick={() => {
+                  if (onOpenAudioChannelMap) onOpenAudioChannelMap(track.id);
+                }}
+              >
+                Channel Map
+              </button>
+            </div>
+            <div className="field__hint">
+              Source channels: {Math.max(1, Math.min(Math.round(Number(track.audio?.channels) || 2), 64))}
+              {' | '}
+              Mapping: {track.audio?.channelMapEnabled ? 'On' : 'Off'}
             </div>
           </div>
         ) : track.kind === 'midi' ? (

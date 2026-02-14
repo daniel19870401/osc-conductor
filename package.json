@@ -1,21 +1,23 @@
 {
   "name": "osc-daw",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "OSC DAW UI prototype with Electron + React + SVG",
   "main": "electron/main.js",
   "type": "commonjs",
   "private": true,
   "scripts": {
-    "dev": "concurrently -k \"vite\" \"wait-on tcp:5170 && electron .\"",
+    "dev": "concurrently -k \"vite\" \"wait-on tcp:5170 && OSC_DAW_DEV_SERVER=1 electron .\"",
     "build": "vite build",
     "preview": "vite preview",
     "start": "electron .",
+    "rebuild:native": "electron-rebuild -f -w audify",
     "pack:mac": "npm run build && electron-builder --mac dir --arm64 --config.mac.identity=null",
     "pack:win": "npm run build && electron-builder --win portable --x64 --config.win.signAndEditExecutable=false",
     "pack:win:dir": "npm run build && electron-builder --win dir --x64 --config.win.signAndEditExecutable=false"
   },
   "dependencies": {
     "@julusian/midi": "^3.6.1",
+    "audify": "^1.10.1",
     "linear-timecode": "^0.1.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
@@ -25,6 +27,7 @@
     "concurrently": "^9.1.0",
     "electron": "^31.6.0",
     "electron-builder": "^26.7.0",
+    "electron-rebuild": "^3.2.9",
     "electron-packager": "^17.1.2",
     "vite": "^5.4.2",
     "wait-on": "^7.2.0"
@@ -33,6 +36,9 @@
     "appId": "com.oscdaw.app",
     "productName": "OSCDAW",
     "asar": true,
+    "asarUnpack": [
+      "node_modules/audify/build/Release/**/*"
+    ],
     "npmRebuild": false,
     "directories": {
       "output": "release"

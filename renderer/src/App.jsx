@@ -32,6 +32,8 @@ const VIRTUAL_MIDI_INPUT_NAME = APP_MIDI_INPUT_PORT_NAME;
 const VIRTUAL_MIDI_OUTPUT_NAME = APP_MIDI_OUTPUT_PORT_NAME;
 const DEV_SERVER_PORT = 5170;
 const ARTNET_PORT = 6454;
+const MAX_AUDIO_CHANNELS = 64;
+const MAX_WEB_AUDIO_OUTPUT_CHANNELS = 32;
 const COPYRIGHT_YEAR = new Date().getFullYear();
 
 const resolveSyncFps = (syncFpsId) => {
@@ -124,6 +126,28 @@ const lerpColor = (from, to, t) => {
     b: clampByte(from.b + (to.b - from.b) * ratio),
   };
 };
+
+const safeDisconnectAudioNode = (node) => {
+  if (!node || typeof node.disconnect !== 'function') return;
+  try {
+    node.disconnect();
+  } catch (error) {
+    // Ignore node disconnect errors.
+  }
+};
+
+const normalizeAudioDeviceName = (value) => (
+  typeof value === 'string'
+    ? value
+      .toLowerCase()
+      .replace(/\([^)]*\)/g, ' ')
+      .replace(/^[^:]+:\s*/g, '')
+      .replace(/\b(virtual|default|output|device)\b/g, ' ')
+      .replace(/[^a-z0-9]+/g, ' ')
+      .trim()
+      .replace(/\s+/g, ' ')
+    : ''
+);
 
 const rgbToRgbw = (rgb) => {
   const white = Math.min(rgb.r, rgb.g, rgb.b);
@@ -249,9 +273,20 @@ export default function App() {
   const [selectedNodeContext, setSelectedNodeContext] = useState({ trackId: null, nodeIds: [] });
   const [editingNode, setEditingNode] = useState(null);
   const [editingCue, setEditingCue] = useState(null);
+  const [audioChannelMapTrackId, setAudioChannelMapTrackId] = useState(null);
+  const [audioChannelMapDraft, setAudioChannelMapDraft] = useState(null);
   const [audioOutputs, setAudioOutputs] = useState([]);
   const [audioInputs, setAudioInputs] = useState([]);
+  const [audioOutputChannelCaps, setAudioOutputChannelCaps] = useState({});
   const [audioOutputError, setAudioOutputError] = useState(null);
+  const [nativeAudioStatus, setNativeAudioStatus] = useState({
+    available: false,
+    streamOpen: false,
+    streamRunning: false,
+    api: null,
+    error: null,
+  });
+  const [nativeAudioDevices, setNativeAudioDevices] = useState([]);
   const [midiStatus, setMidiStatus] = useState({
     inputName: VIRTUAL_MIDI_INPUT_NAME,
     outputName: VIRTUAL_MIDI_OUTPUT_NAME,
@@ -302,6 +337,8 @@ export default function App() {
   const audioUrlRef = useRef(new Map());
   const pendingSeekRef = useRef(new Map());
   const audioContextRef = useRef(null);
+  const audioRoutingRef = useRef(new Map());
+  const audioOutputProbeRef = useRef(new Map());
   const timelineWidthHostRef = useRef(null);
   const resizeHoldUntilRef = useRef(0);
   const resizeIdleTimerRef = useRef(null);
@@ -310,6 +347,7 @@ export default function App() {
   const midiOutputRef = useRef(null);
   const midiTrackRuntimeRef = useRef(new Map());
   const artNetSequenceRef = useRef(new Map());
+  const nativeAudioConfigKeyRef = useRef('');
   const [audioWaveforms, setAudioWaveforms] = useState({});
 
   const compositions = useMemo(
@@ -336,6 +374,10 @@ export default function App() {
   const selectedTrack = useMemo(
     () => project.tracks.find((track) => track.id === selectedTrackId),
     [project.tracks, selectedTrackId]
+  );
+  const audioChannelMapTrack = useMemo(
+    () => project.tracks.find((track) => track.id === audioChannelMapTrackId && track.kind === 'audio') || null,
+    [project.tracks, audioChannelMapTrackId]
   );
   const syncFpsPreset = useMemo(
     () => resolveSyncFps(project.timebase?.syncFps),
@@ -540,6 +582,10 @@ export default function App() {
       audioElementsRef.current.delete(trackId);
       pendingSeekRef.current.delete(trackId);
     });
+    audioRoutingRef.current.forEach((_, trackId) => {
+      if (activeTrackIds.has(trackId)) return;
+      releaseAudioRouting(trackId, true);
+    });
     setAudioWaveforms((prev) => {
       let changed = false;
       const next = { ...prev };
@@ -551,6 +597,15 @@ export default function App() {
       return changed ? next : prev;
     });
   }, [project.tracks]);
+
+  useEffect(() => {
+    if (!audioChannelMapTrackId) return;
+    const exists = project.tracks.some((track) => track.id === audioChannelMapTrackId && track.kind === 'audio');
+    if (!exists) {
+      setAudioChannelMapTrackId(null);
+      setAudioChannelMapDraft(null);
+    }
+  }, [audioChannelMapTrackId, project.tracks]);
 
   useEffect(() => () => {
     if (mtcFollowTimeoutRef.current) {
@@ -569,6 +624,10 @@ export default function App() {
       }
     });
     audioElementsRef.current.clear();
+    audioRoutingRef.current.forEach((_, trackId) => {
+      releaseAudioRouting(trackId, true);
+    });
+    audioRoutingRef.current.clear();
     audioUrlRef.current.forEach((url) => {
       if (typeof url === 'string' && url.startsWith('blob:')) {
         URL.revokeObjectURL(url);
@@ -579,6 +638,10 @@ export default function App() {
     if (audioContextRef.current && typeof audioContextRef.current.close === 'function') {
       audioContextRef.current.close().catch(() => {});
       audioContextRef.current = null;
+    }
+    const bridge = window.oscDaw;
+    if (bridge?.pauseNativeAudio) {
+      bridge.pauseNativeAudio().catch(() => {});
     }
   }, [stopLtcSync]);
 
@@ -657,6 +720,117 @@ export default function App() {
       if (navigator.mediaDevices?.removeEventListener) {
         navigator.mediaDevices.removeEventListener('devicechange', handler);
       }
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const bridge = window.oscDaw;
+    if (!bridge || typeof bridge.getAudioOutputChannels !== 'function') return undefined;
+
+    const loadNativeChannelCaps = async () => {
+      let result = null;
+      try {
+        result = await bridge.getAudioOutputChannels();
+      } catch (error) {
+        result = null;
+      }
+      if (cancelled || !result || !result.ok) return;
+      const byLabelRaw = result.byLabel && typeof result.byLabel === 'object' ? result.byLabel : {};
+      const byLabel = new Map();
+      Object.entries(byLabelRaw).forEach(([label, channels]) => {
+        const key = normalizeAudioDeviceLabel(label);
+        const value = clamp(Math.round(Number(channels) || 0), 1, MAX_AUDIO_CHANNELS);
+        if (!key || !Number.isFinite(value) || value <= 0) return;
+        byLabel.set(key, value);
+      });
+
+      const nextCaps = {};
+      const defaultChannels = clamp(Math.round(Number(result.defaultOutputChannels) || 2), 1, MAX_AUDIO_CHANNELS);
+      nextCaps.default = defaultChannels;
+      const defaultOutputLabel = normalizeAudioDeviceLabel(result.defaultOutputLabel || '');
+
+      audioOutputs.forEach((device) => {
+        if (!device?.deviceId) return;
+        const normalized = normalizeAudioDeviceLabel(device.label || '');
+        let channels = byLabel.get(normalized);
+        if (!Number.isFinite(channels) && normalized) {
+          for (const [labelKey, value] of byLabel.entries()) {
+            if (normalized.includes(labelKey) || labelKey.includes(normalized)) {
+              channels = value;
+              break;
+            }
+          }
+        }
+        if (!Number.isFinite(channels) && normalized) {
+          const labelHint = parseChannelsFromAudioLabel(device.label || '');
+          if (Number.isFinite(labelHint) && labelHint > 0) {
+            channels = labelHint;
+          }
+        }
+        if (!Number.isFinite(channels) && normalized && defaultOutputLabel && normalized === defaultOutputLabel) {
+          channels = defaultChannels;
+        }
+        if (!Number.isFinite(channels) || channels <= 0) return;
+        nextCaps[device.deviceId] = channels;
+      });
+
+      setAudioOutputChannelCaps((prev) => {
+        let changed = false;
+        const merged = { ...prev };
+        Object.entries(nextCaps).forEach(([key, value]) => {
+          const previous = Number(merged[key]);
+          const next = Number.isFinite(previous) && previous > 0
+            ? Math.max(Math.round(previous), value)
+            : value;
+          if (merged[key] === next) return;
+          merged[key] = next;
+          changed = true;
+        });
+        return changed ? merged : prev;
+      });
+    };
+
+    loadNativeChannelCaps();
+    return () => {
+      cancelled = true;
+    };
+  }, [audioOutputs]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const bridge = window.oscDaw;
+    if (!bridge || typeof bridge.getNativeAudioStatus !== 'function') return undefined;
+    const loadNativeAudioStatus = async () => {
+      let status = null;
+      let devices = null;
+      try {
+        [status, devices] = await Promise.all([
+          bridge.getNativeAudioStatus(),
+          typeof bridge.getNativeAudioDevices === 'function'
+            ? bridge.getNativeAudioDevices()
+            : Promise.resolve(null),
+        ]);
+      } catch (error) {
+        status = null;
+        devices = null;
+      }
+      if (cancelled || !status) return;
+      setNativeAudioStatus((prev) => ({
+        ...prev,
+        available: Boolean(status.available),
+        streamOpen: Boolean(status.streamOpen),
+        streamRunning: Boolean(status.streamRunning),
+        api: status.api || null,
+        error: status.error || null,
+      }));
+      if (devices?.ok && Array.isArray(devices.devices)) {
+        setNativeAudioDevices(devices.devices);
+      }
+    };
+    loadNativeAudioStatus();
+    return () => {
+      cancelled = true;
     };
   }, []);
 
@@ -1484,9 +1658,385 @@ export default function App() {
     return Boolean(track.solo);
   };
 
+  const getTrackMeterLevel = (track) => {
+    if (!track) return 0;
+    const kind = track.kind;
+    if (!isTrackEnabled(track, kind)) return 0;
+
+    if (kind === 'audio') {
+      if (!isPlaying) return 0;
+      const waveform = audioWaveforms[track.id];
+      const peaks = Array.isArray(waveform?.peaks)
+        ? waveform.peaks
+        : (Array.isArray(track.audio?.waveformPeaks) ? track.audio.waveformPeaks : []);
+      const duration = Number.isFinite(waveform?.duration) && waveform.duration > 0
+        ? waveform.duration
+        : (Number.isFinite(track.audio?.waveformDuration) && track.audio.waveformDuration > 0
+          ? track.audio.waveformDuration
+          : (Number.isFinite(track.audio?.duration) && track.audio.duration > 0 ? track.audio.duration : 0));
+      const volume = clamp(Number(track.audio?.volume ?? 1), 0, 1);
+      if (peaks.length > 1 && duration > 0) {
+        const safeTime = clamp(playhead, 0, duration);
+        const progress = safeTime / duration;
+        const peakIndex = clamp(Math.round(progress * (peaks.length - 1)), 0, peaks.length - 1);
+        const peak = clamp(Number(peaks[peakIndex]) || 0, 0, 1);
+        return clamp(Math.sqrt(peak) * volume, 0, 1);
+      }
+      return clamp(volume * 0.2, 0, 1);
+    }
+
+    const min = Number.isFinite(track.min) ? track.min : 0;
+    const max = Number.isFinite(track.max) ? track.max : 1;
+    const span = Math.max(max - min, 0.000001);
+    const value = sampleTrackValue(track, playhead);
+    return clamp((value - min) / span, 0, 1);
+  };
+
+  const getMeterLevelClass = (level) => {
+    if (level >= 0.9) return 'is-red';
+    if (level >= 0.72) return 'is-yellow';
+    return 'is-green';
+  };
+
   const getMidiTrackOutputId = (track) => {
     if (typeof track?.midi?.outputId === 'string' && track.midi.outputId) return track.midi.outputId;
     return project.midi?.outputId || VIRTUAL_MIDI_OUTPUT_ID;
+  };
+
+  const getAudioSourceChannels = (track) => (
+    clamp(Math.round(Number(track?.audio?.channels) || 2), 1, MAX_AUDIO_CHANNELS)
+  );
+
+  const getAudioChannelMap = (track, channels = getAudioSourceChannels(track)) => {
+    const safeChannels = clamp(Math.round(Number(channels) || 2), 1, MAX_AUDIO_CHANNELS);
+    const raw = Array.isArray(track?.audio?.channelMap) ? track.audio.channelMap : [];
+    return Array.from({ length: safeChannels }, (_, index) => {
+      const fallback = index + 1;
+      const value = Math.round(Number(raw[index]) || fallback);
+      return clamp(value, 1, MAX_AUDIO_CHANNELS);
+    });
+  };
+
+  const releaseAudioRouting = (trackId, removeEntry = true) => {
+    const routing = audioRoutingRef.current.get(trackId);
+    if (!routing) return;
+    safeDisconnectAudioNode(routing.splitterNode);
+    safeDisconnectAudioNode(routing.mergerNode);
+    safeDisconnectAudioNode(routing.gainNode);
+    safeDisconnectAudioNode(routing.sourceNode);
+    routing.splitterNode = null;
+    routing.mergerNode = null;
+    routing.gainNode = null;
+    routing.sourceNode = null;
+    routing.mapKey = '';
+    if (routing.context && typeof routing.context.close === 'function') {
+      routing.context.close().catch(() => {});
+    }
+    routing.context = null;
+    routing.sinkId = null;
+    if (removeEntry) {
+      audioRoutingRef.current.delete(trackId);
+    }
+  };
+
+  const clearAudioRoutingGraph = (trackId) => {
+    const routing = audioRoutingRef.current.get(trackId);
+    if (!routing) return;
+    safeDisconnectAudioNode(routing.sourceNode);
+    safeDisconnectAudioNode(routing.splitterNode);
+    safeDisconnectAudioNode(routing.mergerNode);
+    safeDisconnectAudioNode(routing.gainNode);
+    routing.splitterNode = null;
+    routing.mergerNode = null;
+    routing.gainNode = null;
+    routing.mapKey = '';
+  };
+
+  const resolveTrackOutputDeviceId = (track) => {
+    const trackDeviceId =
+      typeof track?.audio?.outputDeviceId === 'string' && track.audio.outputDeviceId
+        ? track.audio.outputDeviceId
+        : 'project-default';
+    if (trackDeviceId === 'project-default') {
+      const projectOutput = project.audio?.outputDeviceId || 'default';
+      if (typeof projectOutput === 'string' && projectOutput.startsWith('native:')) {
+        return 'default';
+      }
+      return projectOutput;
+    }
+    if (trackDeviceId.startsWith('native:')) return 'default';
+    return trackDeviceId;
+  };
+
+  const normalizeAudioDeviceLabel = (value) => (
+    typeof value === 'string'
+      ? value.trim().toLowerCase().replace(/\s+/g, ' ')
+      : ''
+  );
+
+  const parseChannelsFromAudioLabel = (label) => {
+    if (typeof label !== 'string') return null;
+    const normalized = label.trim().toLowerCase();
+    if (!normalized) return null;
+    const match = /(\d+)\s*ch(?:annels?)?\b/i.exec(normalized);
+    if (!match) return null;
+    const value = Number(match[1]);
+    if (!Number.isFinite(value) || value <= 0) return null;
+    return clamp(Math.round(value), 1, MAX_AUDIO_CHANNELS);
+  };
+
+  const getDetectedOutputChannels = (deviceId) => {
+    const key = typeof deviceId === 'string' && deviceId ? deviceId : 'default';
+    if (key.startsWith('native:')) {
+      const nativeDeviceId = Number(key.slice('native:'.length));
+      const nativeChannels = nativeAudioDevices.find((device) => device.id === nativeDeviceId)?.outputChannels;
+      if (Number.isFinite(nativeChannels) && nativeChannels > 0) {
+        return clamp(Math.round(nativeChannels), 1, MAX_AUDIO_CHANNELS);
+      }
+    }
+    const value = Number(audioOutputChannelCaps[key]);
+    const labelHint = parseChannelsFromAudioLabel(
+      audioOutputs.find((device) => device.deviceId === key)?.label || ''
+    );
+    if (Number.isFinite(labelHint) && labelHint > 0) {
+      if (!Number.isFinite(value) || value <= 0) {
+        return labelHint;
+      }
+      return clamp(Math.max(Math.round(value), labelHint), 1, MAX_AUDIO_CHANNELS);
+    }
+    if (Number.isFinite(value) && value > 0) {
+      return clamp(Math.round(value), 1, MAX_AUDIO_CHANNELS);
+    }
+    return 2;
+  };
+
+  const probeOutputChannels = useCallback(async (deviceId) => {
+    const key = typeof deviceId === 'string' && deviceId ? deviceId : 'default';
+    if (key.startsWith('native:')) {
+      const nativeDeviceId = Number(key.slice('native:'.length));
+      const nativeChannels = nativeAudioDevices.find((device) => device.id === nativeDeviceId)?.outputChannels;
+      if (Number.isFinite(nativeChannels) && nativeChannels > 0) {
+        return clamp(Math.round(nativeChannels), 1, MAX_AUDIO_CHANNELS);
+      }
+      return 2;
+    }
+    if (nativeAudioStatus.available && key !== 'default') {
+      const fallback = Number(audioOutputChannelCaps[key]);
+      if (Number.isFinite(fallback) && fallback > 0) {
+        return clamp(Math.round(fallback), 1, MAX_AUDIO_CHANNELS);
+      }
+      return 2;
+    }
+    const cached = Number(audioOutputChannelCaps[key]);
+    if (Number.isFinite(cached) && cached > 0) {
+      return clamp(Math.round(cached), 1, MAX_AUDIO_CHANNELS);
+    }
+    const runningProbe = audioOutputProbeRef.current.get(key);
+    if (runningProbe) {
+      return runningProbe;
+    }
+    const probeTask = (async () => {
+      const AudioContextImpl = window.AudioContext || window.webkitAudioContext;
+      if (!AudioContextImpl) return 2;
+      let context = null;
+      try {
+        context = new AudioContextImpl({ latencyHint: 'interactive' });
+        if (typeof context.setSinkId === 'function') {
+          await context.setSinkId(key);
+        }
+        const detected = Math.max(
+          Number(context.destination?.maxChannelCount) || 0,
+          Number(context.destination?.channelCount) || 0,
+          2
+        );
+        const channels = clamp(Math.round(detected), 1, MAX_AUDIO_CHANNELS);
+        setAudioOutputChannelCaps((prev) => {
+          const previous = Number(prev[key]);
+          const next = Number.isFinite(previous) && previous > 0
+            ? Math.max(Math.round(previous), channels)
+            : channels;
+          return prev[key] === next ? prev : { ...prev, [key]: next };
+        });
+        return channels;
+      } catch (error) {
+        setAudioOutputChannelCaps((prev) => (Number.isFinite(prev[key]) ? prev : { ...prev, [key]: 2 }));
+        return 2;
+      } finally {
+        if (context && typeof context.close === 'function') {
+          context.close().catch(() => {});
+        }
+      }
+    })();
+    audioOutputProbeRef.current.set(key, probeTask);
+    try {
+      return await probeTask;
+    } finally {
+      audioOutputProbeRef.current.delete(key);
+    }
+  }, [audioOutputChannelCaps, nativeAudioDevices, nativeAudioStatus.available]);
+
+  useEffect(() => {
+    const resolveOutputId = (track) => {
+      const trackDeviceId =
+        typeof track?.audio?.outputDeviceId === 'string' && track.audio.outputDeviceId
+          ? track.audio.outputDeviceId
+          : 'project-default';
+      if (trackDeviceId === 'project-default') {
+        return project.audio?.outputDeviceId || 'default';
+      }
+      return trackDeviceId;
+    };
+
+    const targets = new Set(['default']);
+    audioOutputs.forEach((device) => {
+      if (typeof device.deviceId === 'string' && device.deviceId) {
+        targets.add(device.deviceId);
+      }
+    });
+    project.tracks.forEach((track) => {
+      if (track.kind !== 'audio') return;
+      if (!track.audio?.channelMapEnabled) return;
+      targets.add(resolveOutputId(track));
+    });
+    if (audioChannelMapTrack) {
+      targets.add(resolveOutputId(audioChannelMapTrack));
+    }
+    targets.forEach((deviceId) => {
+      probeOutputChannels(deviceId);
+    });
+  }, [audioOutputs, project.tracks, audioChannelMapTrack, project.audio?.outputDeviceId, probeOutputChannels]);
+
+  const applyRoutingSinkId = (routing, deviceId) => {
+    const context = routing?.context;
+    if (!context || typeof context.setSinkId !== 'function') return;
+    if (routing.sinkId === deviceId) return;
+    context.setSinkId(deviceId)
+      .then(() => {
+        routing.sinkId = deviceId;
+        routing.mapKey = '';
+      })
+      .catch(() => {
+        routing.sinkId = null;
+        routing.mapKey = '';
+        // Ignore sink routing errors when unsupported by browser/runtime.
+      });
+  };
+
+  const ensureMappedAudioRouting = (track, audio) => {
+    if (!track || track.kind !== 'audio' || !audio) return null;
+    if (!track.audio?.channelMapEnabled) {
+      clearAudioRoutingGraph(track.id);
+      return null;
+    }
+    const targetDeviceId = resolveTrackOutputDeviceId(track);
+    const outputLimit = getDetectedOutputChannels(targetDeviceId);
+    // Chromium mixer frequently fails for non-default sink or >32ch output.
+    // Keep playback alive by falling back to HTMLMediaElement routing in those cases.
+    if (targetDeviceId !== 'default' || outputLimit > MAX_WEB_AUDIO_OUTPUT_CHANNELS) {
+      clearAudioRoutingGraph(track.id);
+      return null;
+    }
+    const AudioContextImpl = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextImpl) {
+      clearAudioRoutingGraph(track.id);
+      return null;
+    }
+
+    let routing = audioRoutingRef.current.get(track.id);
+    if (!routing || routing.audio !== audio) {
+      if (routing) {
+        releaseAudioRouting(track.id, true);
+      }
+      routing = {
+        context: null,
+        audio,
+        sourceNode: null,
+        splitterNode: null,
+        mergerNode: null,
+        gainNode: null,
+        mapKey: '',
+        sinkId: null,
+      };
+      audioRoutingRef.current.set(track.id, routing);
+    }
+
+    if (!routing.context) {
+      try {
+        routing.context = new AudioContextImpl({
+          latencyHint: 'interactive',
+          sinkId: targetDeviceId,
+        });
+      } catch (error) {
+        routing.context = new AudioContextImpl({ latencyHint: 'interactive' });
+      }
+      routing.sinkId = null;
+    }
+    const context = routing.context;
+    if (context.state === 'suspended' && typeof context.resume === 'function') {
+      context.resume().catch(() => {});
+    }
+    applyRoutingSinkId(routing, targetDeviceId);
+    if (!Number.isFinite(audioOutputChannelCaps[targetDeviceId])) {
+      probeOutputChannels(targetDeviceId);
+    }
+
+    if (!routing.sourceNode) {
+      try {
+        routing.sourceNode = context.createMediaElementSource(audio);
+      } catch (error) {
+        clearAudioRoutingGraph(track.id);
+        return null;
+      }
+    }
+
+    const sourceChannels = getAudioSourceChannels(track);
+    const destinationLimit = Number(context.destination?.maxChannelCount);
+    const safeDestinationLimit = Number.isFinite(destinationLimit) && destinationLimit > 0
+      ? clamp(Math.round(destinationLimit), 1, MAX_WEB_AUDIO_OUTPUT_CHANNELS)
+      : MAX_WEB_AUDIO_OUTPUT_CHANNELS;
+    const routeOutputLimit = clamp(
+      Math.min(outputLimit, safeDestinationLimit),
+      1,
+      MAX_WEB_AUDIO_OUTPUT_CHANNELS
+    );
+    const channelMap = getAudioChannelMap(track, sourceChannels)
+      .map((output) => clamp(output, 1, routeOutputLimit));
+    const outputChannels = Math.max(
+      channelMap.reduce((max, value) => Math.max(max, value), 0),
+      2
+    );
+    const mapKey = `${targetDeviceId}|${sourceChannels}|${routeOutputLimit}|${outputChannels}|${channelMap.join(',')}`;
+    if (routing.mapKey !== mapKey || !routing.splitterNode || !routing.mergerNode || !routing.gainNode) {
+      clearAudioRoutingGraph(track.id);
+      try {
+        routing.splitterNode = context.createChannelSplitter(sourceChannels);
+        routing.mergerNode = context.createChannelMerger(outputChannels);
+        routing.gainNode = context.createGain();
+        try {
+          routing.splitterNode.channelInterpretation = 'discrete';
+        } catch (error) {
+          // Ignore unsupported channel interpretation settings.
+        }
+        try {
+          routing.mergerNode.channelInterpretation = 'discrete';
+        } catch (error) {
+          // Ignore unsupported channel interpretation settings.
+        }
+        routing.sourceNode.connect(routing.splitterNode);
+        channelMap.forEach((outChannel, inputIndex) => {
+          if (!Number.isFinite(outChannel) || outChannel <= 0 || outChannel > outputChannels) return;
+          routing.splitterNode.connect(routing.mergerNode, inputIndex, outChannel - 1);
+        });
+        routing.mergerNode.connect(routing.gainNode);
+        routing.gainNode.connect(context.destination);
+        routing.mapKey = mapKey;
+      } catch (error) {
+        clearAudioRoutingGraph(track.id);
+        return null;
+      }
+    }
+
+    return routing;
   };
 
   const getWaveformSampleCount = (durationHint = project.view.length) => {
@@ -1644,7 +2194,11 @@ export default function App() {
       peaks[i] = Math.min(Math.max(peak, 0), 1);
     }
 
-    return { peaks, duration };
+    return {
+      peaks,
+      duration,
+      channels: header.channels,
+    };
   };
 
   const decodeAudioBuffer = async (context, arrayBuffer) => new Promise((resolve, reject) => {
@@ -1714,9 +2268,199 @@ export default function App() {
     return audio;
   };
 
-  const applyAudioOutput = async (audio) => {
+  const audioOutputLabelById = useMemo(() => {
+    const map = new Map();
+    audioOutputs.forEach((device) => {
+      if (!device?.deviceId) return;
+      map.set(device.deviceId, device.label || '');
+    });
+    return map;
+  }, [audioOutputs]);
+  const nativeAudioTrackDescriptors = useMemo(() => (
+    project.tracks
+      .filter((track) => track.kind === 'audio' && track.audio?.src)
+      .map((track) => {
+        const filePath =
+          typeof track.audio?.nativePath === 'string' && track.audio.nativePath.trim()
+            ? track.audio.nativePath.trim()
+            : '';
+        const sourceChannels = clamp(Math.round(Number(track.audio?.channels) || 2), 1, MAX_AUDIO_CHANNELS);
+        const channelMapEnabled = Boolean(track.audio?.channelMapEnabled);
+        const mapped = Array.isArray(track.audio?.channelMap) ? track.audio.channelMap : [];
+        const channelMap = channelMapEnabled
+          ? mapped
+          : Array.from({ length: sourceChannels }, (_, index) => index + 1);
+        return {
+          id: track.id,
+          filePath,
+          volume: clamp(Number.isFinite(track.audio?.volume) ? track.audio.volume : 1, 0, 1),
+          enabled: isTrackEnabled(track, 'audio'),
+          outputDeviceId:
+            typeof track.audio?.outputDeviceId === 'string' && track.audio.outputDeviceId
+              ? track.audio.outputDeviceId
+              : 'project-default',
+          sourceChannels,
+          channelMap,
+        };
+      })
+      .filter((track) => track.filePath)
+  ), [project.tracks]);
+  const totalAudioTracksWithSource = useMemo(
+    () => project.tracks.filter((track) => track.kind === 'audio' && track.audio?.src).length,
+    [project.tracks]
+  );
+  const useNativeAudioEngine = Boolean(
+    nativeAudioStatus.available
+    && nativeAudioTrackDescriptors.length > 0
+  );
+
+  const resolveNativeOutputId = useCallback((rawOutputId) => {
+    const outputId = typeof rawOutputId === 'string' && rawOutputId ? rawOutputId : 'default';
+    if (outputId === 'project-default' || outputId === 'default' || outputId.startsWith('native:')) {
+      return outputId;
+    }
+    const browserLabel = audioOutputLabelById.get(outputId) || '';
+    const normalizedBrowserLabel = normalizeAudioDeviceName(browserLabel);
+    if (!normalizedBrowserLabel) return outputId;
+    const matched = nativeAudioDevices.find((device) => {
+      const normalizedNativeName = normalizeAudioDeviceName(device?.name || '');
+      if (!normalizedNativeName) return false;
+      return normalizedNativeName === normalizedBrowserLabel
+        || normalizedNativeName.includes(normalizedBrowserLabel)
+        || normalizedBrowserLabel.includes(normalizedNativeName);
+    });
+    return matched ? `native:${matched.id}` : outputId;
+  }, [audioOutputLabelById, nativeAudioDevices]);
+
+  useEffect(() => {
+    if (!nativeAudioStatus.available) return;
+    if (totalAudioTracksWithSource <= 0) return;
+    if (nativeAudioTrackDescriptors.length === totalAudioTracksWithSource) return;
+    setNativeAudioStatus((prev) => {
+      const nextError = 'Some audio tracks are not cached for native playback. Re-import audio files once.';
+      if (prev.error === nextError) return prev;
+      return { ...prev, error: nextError };
+    });
+  }, [nativeAudioStatus.available, totalAudioTracksWithSource, nativeAudioTrackDescriptors.length]);
+
+  const configureNativeAudioEngine = useCallback(async () => {
+    if (!useNativeAudioEngine) return;
+    const bridge = window.oscDaw;
+    if (!bridge?.configureNativeAudio || !bridge?.setNativeAudioTracks) return;
+    const explicitTrackOutputs = nativeAudioTrackDescriptors
+      .map((track) => resolveNativeOutputId(track.outputDeviceId))
+      .filter((id) => typeof id === 'string' && id && id !== 'project-default');
+    const outputId = explicitTrackOutputs[0] || resolveNativeOutputId(project.audio?.outputDeviceId || 'default');
+    let outputLabel = audioOutputLabelById.get(outputId) || '';
+    let nativeOutputHint = outputId;
+    if (typeof outputId === 'string' && outputId.startsWith('native:')) {
+      const numericId = Number(outputId.slice('native:'.length));
+      if (Number.isFinite(numericId)) {
+        nativeOutputHint = numericId;
+      }
+      if (!outputLabel) {
+        outputLabel = nativeAudioDevices.find((device) => `native:${device.id}` === outputId)?.name || '';
+      }
+    }
+    const highestMappedChannel = nativeAudioTrackDescriptors.reduce((maxValue, track) => {
+      const localMax = track.channelMap.reduce((innerMax, value) => {
+        const mapped = Math.round(Number(value) || 0);
+        if (!Number.isFinite(mapped) || mapped <= 0) return innerMax;
+        return Math.max(innerMax, mapped);
+      }, track.sourceChannels || 2);
+      return Math.max(maxValue, localMax);
+    }, 2);
+    const outputChannels = clamp(highestMappedChannel, 2, MAX_AUDIO_CHANNELS);
+    const configPayload = {
+      outputId,
+      outputLabel,
+      outputHint: nativeOutputHint,
+      sampleRate: clamp(Number(project.audio?.sampleRate) || 48000, 8000, 192000),
+      bufferFrames: Number(project.audio?.bufferSize) || 1024,
+      outputChannels,
+    };
+    const tracksPayload = {
+      tracks: nativeAudioTrackDescriptors,
+    };
+    const nextConfigKey = JSON.stringify({
+      config: configPayload,
+      tracks: tracksPayload.tracks.map((track) => ({
+        id: track.id,
+        filePath: track.filePath,
+        volume: track.volume,
+        enabled: track.enabled,
+        sourceChannels: track.sourceChannels,
+        channelMap: track.channelMap,
+      })),
+    });
+    if (nativeAudioConfigKeyRef.current === nextConfigKey) return;
+    if (explicitTrackOutputs.length > 1) {
+      setNativeAudioStatus((prev) => ({
+        ...prev,
+        error: `Native audio currently uses one output device. Using ${outputId}.`,
+      }));
+    }
+    const configureResult = await bridge.configureNativeAudio(configPayload);
+    if (!configureResult?.ok) {
+      setNativeAudioStatus((prev) => ({
+        ...prev,
+        error: configureResult?.error || 'Failed to configure native audio output.',
+      }));
+      return;
+    }
+    const setTracksResult = await bridge.setNativeAudioTracks(tracksPayload);
+    if (!setTracksResult?.ok) {
+      setNativeAudioStatus((prev) => ({
+        ...prev,
+        error: setTracksResult?.error || 'Failed to load audio tracks into native engine.',
+      }));
+      return;
+    }
+    const loadedTracks = Math.round(Number(setTracksResult.loadedTracks) || 0);
+    if (loadedTracks !== nativeAudioTrackDescriptors.length) {
+      setNativeAudioStatus((prev) => ({
+        ...prev,
+        error: `Native audio loaded ${loadedTracks}/${nativeAudioTrackDescriptors.length} tracks. Please use WAV files.`,
+      }));
+    } else {
+      setNativeAudioStatus((prev) => (prev.error ? { ...prev, error: null } : prev));
+    }
+    nativeAudioConfigKeyRef.current = nextConfigKey;
+  }, [
+    useNativeAudioEngine,
+    project.audio?.outputDeviceId,
+    project.audio?.sampleRate,
+    project.audio?.bufferSize,
+    audioOutputLabelById,
+    nativeAudioDevices,
+    nativeAudioTrackDescriptors,
+    resolveNativeOutputId,
+  ]);
+
+  const seekNativeAudioEngine = useCallback((time) => {
+    if (!useNativeAudioEngine) return;
+    const bridge = window.oscDaw;
+    if (!bridge?.seekNativeAudio) return;
+    bridge.seekNativeAudio({ playhead: clamp(Number(time) || 0, 0, project.view.length) }).catch(() => {});
+  }, [useNativeAudioEngine, project.view.length]);
+
+  const playNativeAudioEngine = useCallback((time) => {
+    if (!useNativeAudioEngine) return;
+    const bridge = window.oscDaw;
+    if (!bridge?.playNativeAudio) return;
+    bridge.playNativeAudio({ playhead: clamp(Number(time) || 0, 0, project.view.length) }).catch(() => {});
+  }, [useNativeAudioEngine, project.view.length]);
+
+  const pauseNativeAudioEngine = useCallback(() => {
+    if (!useNativeAudioEngine) return;
+    const bridge = window.oscDaw;
+    if (!bridge?.pauseNativeAudio) return;
+    bridge.pauseNativeAudio().catch(() => {});
+  }, [useNativeAudioEngine]);
+
+  const applyAudioOutput = async (track, audio) => {
     if (!audio || typeof audio.setSinkId !== 'function') return;
-    const deviceId = project.audio?.outputDeviceId || 'default';
+    const deviceId = resolveTrackOutputDeviceId(track);
     try {
       await audio.setSinkId(deviceId);
     } catch (error) {
@@ -1725,12 +2469,26 @@ export default function App() {
   };
 
   const syncAudioToPlayhead = (time) => {
+    if (useNativeAudioEngine) {
+      seekNativeAudioEngine(time);
+    }
     project.tracks.forEach((track) => {
       if (track.kind !== 'audio' || !track.audio?.src) return;
       const audio = getAudioElement(track);
       if (!audio) return;
       audio.pause();
       seekAudioElement(track, audio, time);
+    });
+  };
+
+  const resumeAudioEngines = () => {
+    if (audioContextRef.current?.state === 'suspended' && typeof audioContextRef.current.resume === 'function') {
+      audioContextRef.current.resume().catch(() => {});
+    }
+    audioRoutingRef.current.forEach((routing) => {
+      const context = routing?.context;
+      if (!context || context.state !== 'suspended' || typeof context.resume !== 'function') return;
+      context.resume().catch(() => {});
     });
   };
 
@@ -1744,6 +2502,7 @@ export default function App() {
     }
     const previousUrl = audioUrlRef.current.get(trackId);
     const blobSrc = URL.createObjectURL(file);
+    let nativePath = typeof file.path === 'string' ? file.path : '';
     const mediaSrc = blobSrc;
     if (!mediaSrc) return;
     audioUrlRef.current.set(trackId, blobSrc);
@@ -1757,6 +2516,7 @@ export default function App() {
       (Number.isFinite(track.audio?.duration) && track.audio.duration > 0
         ? track.audio.duration
         : project.view.length) || 1;
+    let sourceChannels = clamp(Math.round(Number(track.audio?.channels) || 2), 1, MAX_AUDIO_CHANNELS);
     const initialSampleCount = getWaveformSampleCount(initialDuration);
     const placeholderPeaks = createSilentPeaks(initialSampleCount);
     setAudioWaveforms((prev) => ({
@@ -1769,8 +2529,10 @@ export default function App() {
       patch: {
         audio: {
           src: mediaSrc,
+          nativePath,
           name: file.name,
           duration: initialDuration,
+          channels: sourceChannels,
           waveformPeaks: placeholderPeaks,
           waveformDuration: initialDuration,
         },
@@ -1804,6 +2566,21 @@ export default function App() {
       arrayBuffer = null;
     }
 
+    const bridge = window.oscDaw;
+    if (arrayBuffer && arrayBuffer.byteLength > 0 && bridge?.cacheNativeAudioFile) {
+      try {
+        const cached = await bridge.cacheNativeAudioFile({
+          name: file.name,
+          bytes: new Uint8Array(arrayBuffer),
+        });
+        if (cached?.ok && typeof cached.path === 'string' && cached.path) {
+          nativePath = cached.path;
+        }
+      } catch (error) {
+        // Keep original path fallback when caching fails.
+      }
+    }
+
     if (blobSrc && audioUrlRef.current.get(trackId) !== blobSrc) {
       return;
     }
@@ -1816,6 +2593,9 @@ export default function App() {
         peaks = wavResult.peaks;
         if (wavResult.duration > 0) {
           duration = wavResult.duration;
+        }
+        if (Number.isFinite(wavResult.channels) && wavResult.channels > 0) {
+          sourceChannels = clamp(Math.round(wavResult.channels), 1, MAX_AUDIO_CHANNELS);
         }
       }
     }
@@ -1832,6 +2612,9 @@ export default function App() {
           const audioBuffer = await decodeAudioBuffer(context, arrayBuffer);
           if (audioBuffer?.duration > 0) {
             duration = audioBuffer.duration;
+          }
+          if (Number.isFinite(audioBuffer?.numberOfChannels) && audioBuffer.numberOfChannels > 0) {
+            sourceChannels = clamp(Math.round(audioBuffer.numberOfChannels), 1, MAX_AUDIO_CHANNELS);
           }
           const decodedPeaks = computePeaks(audioBuffer, getWaveformSampleCount(duration));
           if (decodedPeaks.length) {
@@ -1861,8 +2644,10 @@ export default function App() {
       patch: {
         audio: {
           src: mediaSrc,
+          nativePath,
           name: file.name,
           duration,
+          channels: sourceChannels,
           waveformPeaks: peaks,
           waveformDuration: duration,
         },
@@ -1941,20 +2726,49 @@ export default function App() {
   }, [dispatch, project.timebase.sync, project.view.end, project.view.length, project.view.start]);
 
   useEffect(() => {
+    if (useNativeAudioEngine) {
+      const audioTracks = project.tracks.filter((track) => track.kind === 'audio' && track.audio?.src);
+      audioTracks.forEach((track) => {
+        const audio = getAudioElement(track);
+        if (!audio) return;
+        audio.pause();
+      });
+      return undefined;
+    }
     const audioTracks = project.tracks.filter((track) => track.kind === 'audio' && track.audio?.src);
     audioTracks.forEach((track) => {
       const audio = getAudioElement(track);
       if (!audio) return;
-      applyAudioOutput(audio);
       const enabled = isTrackEnabled(track, 'audio');
       const targetVolume = enabled ? clamp(track.audio?.volume ?? 1, 0, 1) : 0;
-      try {
-        if (!Number.isFinite(audio.volume) || Math.abs(audio.volume - targetVolume) > 0.0001) {
-          audio.volume = targetVolume;
+      const routing = ensureMappedAudioRouting(track, audio);
+      const routingActive = Boolean(routing?.gainNode && routing.context?.state === 'running');
+      if (routingActive) {
+        try {
+          if (!Number.isFinite(audio.volume) || Math.abs(audio.volume - 1) > 0.0001) {
+            audio.volume = 1;
+          }
+          audio.muted = true;
+          const gainValue = clamp(targetVolume, 0, 1);
+          if (Math.abs((routing.gainNode.gain?.value ?? 0) - gainValue) > 0.0001) {
+            routing.gainNode.gain.value = gainValue;
+          }
+        } catch (error) {
+          // Guard against routing assignment errors.
         }
-        audio.muted = !enabled;
-      } catch (error) {
-        // Guard against invalid volume assignments.
+      } else {
+        if (routing?.context?.state === 'suspended' && typeof routing.context.resume === 'function') {
+          routing.context.resume().catch(() => {});
+        }
+        applyAudioOutput(track, audio);
+        try {
+          if (!Number.isFinite(audio.volume) || Math.abs(audio.volume - targetVolume) > 0.0001) {
+            audio.volume = targetVolume;
+          }
+          audio.muted = !enabled;
+        } catch (error) {
+          // Guard against invalid volume assignments.
+        }
       }
       if (isPlaying) {
         const duration = getTrackAudioDuration(track, audio);
@@ -1973,7 +2787,7 @@ export default function App() {
         audio.pause();
       }
     });
-  }, [isPlaying, playhead, project.tracks, project.audio?.outputDeviceId]);
+  }, [isPlaying, playhead, project.tracks, project.audio?.outputDeviceId, useNativeAudioEngine]);
 
   useEffect(() => {
     if (!isPlaying) return undefined;
@@ -2469,6 +3283,99 @@ export default function App() {
         }
         return;
       }
+      if (audioChannelMapTrackId) {
+        if (event.key === 'Escape') {
+          event.preventDefault();
+          setAudioChannelMapTrackId(null);
+          setAudioChannelMapDraft(null);
+          return;
+        }
+        const isPlainEnter = event.key === 'Enter' && !event.shiftKey && !event.altKey && !event.ctrlKey && !event.metaKey;
+        const isPlainArrowDown = event.key === 'ArrowDown' && !event.shiftKey && !event.altKey && !event.ctrlKey && !event.metaKey;
+        if (isPlainEnter || isPlainArrowDown) {
+          event.preventDefault();
+          const currentTrack = project.tracks.find(
+            (track) => track.id === audioChannelMapTrackId && track.kind === 'audio'
+          );
+          if (!currentTrack) {
+            setAudioChannelMapTrackId(null);
+            setAudioChannelMapDraft(null);
+            return;
+          }
+          const outputDeviceId =
+            typeof audioChannelMapDraft?.outputDeviceId === 'string' && audioChannelMapDraft.outputDeviceId
+              ? audioChannelMapDraft.outputDeviceId
+              : (typeof currentTrack.audio?.outputDeviceId === 'string' && currentTrack.audio.outputDeviceId
+                ? currentTrack.audio.outputDeviceId
+                : 'project-default');
+          const sourceChannels = clamp(Math.round(Number(currentTrack.audio?.channels) || 2), 1, MAX_AUDIO_CHANNELS);
+          const resolvedOutputDeviceId =
+            outputDeviceId === 'project-default'
+              ? (project.audio?.outputDeviceId || 'default')
+              : outputDeviceId;
+          const outputChannelCount = getDetectedOutputChannels(resolvedOutputDeviceId);
+          const rawChannelMap = Array.isArray(audioChannelMapDraft?.channelMap)
+            ? audioChannelMapDraft.channelMap
+            : (Array.isArray(currentTrack.audio?.channelMap) ? currentTrack.audio.channelMap : []);
+          const channelMap = Array.from({ length: sourceChannels }, (_, index) => {
+            const fallback = ((index % outputChannelCount) + 1);
+            const value = Math.round(Number(rawChannelMap[index]) || fallback);
+            return clamp(value, 1, outputChannelCount);
+          });
+          dispatch({
+            type: 'update-track',
+            id: currentTrack.id,
+            patch: {
+              audio: {
+                outputDeviceId,
+                channelMapEnabled: true,
+                channels: sourceChannels,
+                channelMap,
+              },
+            },
+          });
+          const audioTrackIds = project.tracks
+            .filter((track) => track.kind === 'audio')
+            .map((track) => track.id);
+          const currentIndex = audioTrackIds.indexOf(currentTrack.id);
+          const nextTrackId = currentIndex >= 0 ? audioTrackIds[currentIndex + 1] : null;
+          if (!nextTrackId) {
+            setAudioChannelMapTrackId(null);
+            setAudioChannelMapDraft(null);
+            return;
+          }
+          const nextTrack = project.tracks.find(
+            (track) => track.id === nextTrackId && track.kind === 'audio'
+          );
+          if (!nextTrack) {
+            setAudioChannelMapTrackId(null);
+            setAudioChannelMapDraft(null);
+            return;
+          }
+          const nextOutputDeviceId =
+            typeof nextTrack.audio?.outputDeviceId === 'string' && nextTrack.audio.outputDeviceId
+              ? nextTrack.audio.outputDeviceId
+              : 'project-default';
+          const nextSourceChannels = clamp(Math.round(Number(nextTrack.audio?.channels) || 2), 1, MAX_AUDIO_CHANNELS);
+          const nextResolvedOutputDeviceId =
+            nextOutputDeviceId === 'project-default'
+              ? (project.audio?.outputDeviceId || 'default')
+              : nextOutputDeviceId;
+          const nextOutputChannelCount = getDetectedOutputChannels(nextResolvedOutputDeviceId);
+          const nextRaw = Array.isArray(nextTrack.audio?.channelMap) ? nextTrack.audio.channelMap : [];
+          const nextChannelMap = Array.from({ length: nextSourceChannels }, (_, index) => {
+            const fallback = ((index % nextOutputChannelCount) + 1);
+            const value = Math.round(Number(nextRaw[index]) || fallback);
+            return clamp(value, 1, nextOutputChannelCount);
+          });
+          setAudioChannelMapDraft({
+            outputDeviceId: nextOutputDeviceId,
+            channelMap: nextChannelMap,
+          });
+          setAudioChannelMapTrackId(nextTrackId);
+        }
+        return;
+      }
       const key = event.key?.toLowerCase();
       const withCommand = event.metaKey || event.ctrlKey;
       if (withCommand && key === 'c') {
@@ -2682,6 +3589,7 @@ export default function App() {
   }, [
     isHelpOpen,
     multiAddDialog,
+    audioChannelMapTrackId,
     isPlaying,
     playhead,
     selectedTrackId,
@@ -2690,8 +3598,10 @@ export default function App() {
     handlePlayToggle,
     project.cues,
     project.tracks,
+    project.audio?.outputDeviceId,
     project.view.length,
     syncFpsPreset.fps,
+    audioChannelMapDraft,
   ]);
 
   useEffect(() => {
@@ -2742,6 +3652,79 @@ export default function App() {
   const handlePatchTrack = (patch) => {
     if (!selectedTrack) return;
     dispatch({ type: 'update-track', id: selectedTrack.id, patch });
+  };
+
+  const openAudioChannelMapDialog = (trackId) => {
+    const track = project.tracks.find((item) => item.id === trackId);
+    if (!track || track.kind !== 'audio') return;
+    const outputDeviceId =
+      typeof track.audio?.outputDeviceId === 'string' && track.audio.outputDeviceId
+        ? track.audio.outputDeviceId
+        : 'project-default';
+    const sourceChannels = clamp(Math.round(Number(track.audio?.channels) || 2), 1, MAX_AUDIO_CHANNELS);
+    const resolvedOutputDeviceId =
+      outputDeviceId === 'project-default'
+        ? (project.audio?.outputDeviceId || 'default')
+        : outputDeviceId;
+    const outputChannelCount = getDetectedOutputChannels(resolvedOutputDeviceId);
+    const raw = Array.isArray(track.audio?.channelMap) ? track.audio.channelMap : [];
+    const channelMap = Array.from({ length: sourceChannels }, (_, index) => {
+      const fallback = ((index % outputChannelCount) + 1);
+      const value = Math.round(Number(raw[index]) || fallback);
+      return clamp(value, 1, outputChannelCount);
+    });
+    setAudioChannelMapDraft({
+      outputDeviceId,
+      channelMap,
+    });
+    setAudioChannelMapTrackId(trackId);
+  };
+
+  const closeAudioChannelMapDialog = () => {
+    setAudioChannelMapTrackId(null);
+    setAudioChannelMapDraft(null);
+  };
+
+  const patchAudioChannelMapTrack = (trackId, audioPatch) => {
+    if (!trackId) return;
+    dispatch({
+      type: 'update-track',
+      id: trackId,
+      patch: {
+        audio: audioPatch,
+      },
+    });
+  };
+
+  const setAudioMapRoute = (rowIndex, outputChannel) => {
+    setAudioChannelMapDraft((prev) => {
+      if (!prev) return prev;
+      const nextMap = Array.from({ length: audioMapSourceChannels }, (_, index) => {
+        const fallback = ((index % audioMapOutputChannelCount) + 1);
+        const value = Math.round(Number(prev.channelMap?.[index]) || fallback);
+        return clamp(value, 1, audioMapOutputChannelCount);
+      });
+      nextMap[rowIndex] = clamp(outputChannel, 1, audioMapOutputChannelCount);
+      return {
+        ...prev,
+        channelMap: nextMap,
+      };
+    });
+  };
+
+  const confirmAudioChannelMap = () => {
+    if (!audioChannelMapTrack) return;
+    const outputDeviceId =
+      typeof audioMapSelectedOutputDeviceId === 'string' && audioMapSelectedOutputDeviceId
+        ? audioMapSelectedOutputDeviceId
+        : 'project-default';
+    patchAudioChannelMapTrack(audioChannelMapTrack.id, {
+      outputDeviceId,
+      channelMapEnabled: true,
+      channels: audioMapSourceChannels,
+      channelMap: audioMapChannelMap,
+    });
+    closeAudioChannelMapDialog();
   };
 
   const toggleTrackMute = (trackId) => {
@@ -3015,22 +3998,32 @@ export default function App() {
   const handleStop = () => {
     setIsPlaying(false);
     stopInternalClock();
+    pauseNativeAudioEngine();
   };
 
-  function handlePlayToggle() {
+  async function handlePlayToggle() {
     if (isPlaying) {
       setIsPlaying(false);
       stopInternalClock();
       return;
     }
-    if (audioContextRef.current?.state === 'suspended' && typeof audioContextRef.current.resume === 'function') {
-      audioContextRef.current.resume().catch(() => {});
+    if (useNativeAudioEngine) {
+      await configureNativeAudioEngine().catch(() => {});
+      playNativeAudioEngine(playhead);
     }
+    resumeAudioEngines();
     project.tracks.forEach((track) => {
       if (track.kind !== 'audio' || !track.audio?.src) return;
       if (!isTrackEnabled(track, 'audio')) return;
+      if (useNativeAudioEngine) return;
       const audio = getAudioElement(track);
       if (!audio) return;
+      if (track.audio?.channelMapEnabled) {
+        const routing = ensureMappedAudioRouting(track, audio);
+        if (routing?.context?.state === 'suspended' && typeof routing.context.resume === 'function') {
+          routing.context.resume().catch(() => {});
+        }
+      }
       seekAudioElement(track, audio, playhead);
       const result = audio.play();
       if (result && typeof result.catch === 'function') {
@@ -3050,6 +4043,7 @@ export default function App() {
   const handleLocate = () => {
     setIsPlaying(false);
     stopInternalClock();
+    pauseNativeAudioEngine();
     dispatch({ type: 'scroll-time', start: 0 });
     setPlayhead(0);
     syncAudioToPlayhead(0);
@@ -3143,6 +4137,10 @@ export default function App() {
         audio.load();
       });
       audioElementsRef.current.clear();
+      audioRoutingRef.current.forEach((_, trackId) => {
+        releaseAudioRouting(trackId, true);
+      });
+      audioRoutingRef.current.clear();
       audioUrlRef.current.forEach((url) => {
         if (typeof url === 'string' && url.startsWith('blob:')) {
           URL.revokeObjectURL(url);
@@ -3155,6 +4153,8 @@ export default function App() {
       dispatch({ type: 'load-project', project: data });
       setIsPlaying(false);
       setIsRecording(false);
+      setAudioChannelMapTrackId(null);
+      setAudioChannelMapDraft(null);
       setPlayhead(data?.view?.start ?? 0);
     } catch (error) {
       window.alert('Failed to load project JSON.');
@@ -3193,7 +4193,7 @@ export default function App() {
       const target = event.target;
       const tag = target?.tagName?.toLowerCase();
       if (tag === 'input' || tag === 'textarea' || target?.isContentEditable) return;
-      if (isSettingsOpen || isHelpOpen || editingNode || editingCue) return;
+      if (isSettingsOpen || isHelpOpen || editingNode || editingCue || audioChannelMapTrackId) return;
 
       const delta = getWheelDelta(event);
       if (delta === 0) return;
@@ -3212,7 +4212,7 @@ export default function App() {
     return () => {
       window.removeEventListener('wheel', handleWheelZoom);
     };
-  }, [isSettingsOpen, isHelpOpen, editingNode, editingCue, playhead]);
+  }, [isSettingsOpen, isHelpOpen, editingNode, editingCue, audioChannelMapTrackId, playhead]);
 
   const currentTime = useMemo(
     () => formatHmsfTimecode(playhead, syncFpsPreset.fps),
@@ -3229,6 +4229,52 @@ export default function App() {
     if (height < 120) return 'medium';
     return 'full';
   }, [project.view.trackHeight]);
+  const audioMapSourceChannels = useMemo(
+    () => clamp(Math.round(Number(audioChannelMapTrack?.audio?.channels) || 2), 1, MAX_AUDIO_CHANNELS),
+    [audioChannelMapTrack]
+  );
+  const audioMapProjectOutputId = project.audio?.outputDeviceId || 'default';
+  const audioMapProjectOutputLabel = useMemo(() => {
+    if (audioMapProjectOutputId === 'default') return 'System Default';
+    if (typeof audioMapProjectOutputId === 'string' && audioMapProjectOutputId.startsWith('native:')) {
+      const nativeDeviceId = Number(audioMapProjectOutputId.slice('native:'.length));
+      return nativeAudioDevices.find((device) => device.id === nativeDeviceId)?.name || audioMapProjectOutputId;
+    }
+    return audioOutputs.find((device) => device.deviceId === audioMapProjectOutputId)?.label || audioMapProjectOutputId;
+  }, [audioMapProjectOutputId, audioOutputs, nativeAudioDevices]);
+  const audioMapSelectedOutputDeviceId = useMemo(() => {
+    if (typeof audioChannelMapDraft?.outputDeviceId === 'string' && audioChannelMapDraft.outputDeviceId) {
+      return audioChannelMapDraft.outputDeviceId;
+    }
+    if (typeof audioChannelMapTrack?.audio?.outputDeviceId === 'string' && audioChannelMapTrack.audio.outputDeviceId) {
+      return audioChannelMapTrack.audio.outputDeviceId;
+    }
+    return 'project-default';
+  }, [audioChannelMapDraft, audioChannelMapTrack]);
+  const audioMapResolvedOutputDeviceId = useMemo(() => {
+    if (audioMapSelectedOutputDeviceId === 'project-default') {
+      return audioMapProjectOutputId;
+    }
+    return audioMapSelectedOutputDeviceId;
+  }, [audioMapSelectedOutputDeviceId, audioMapProjectOutputId]);
+  const audioMapOutputChannelCount = useMemo(
+    () => getDetectedOutputChannels(audioMapResolvedOutputDeviceId),
+    [audioMapResolvedOutputDeviceId, audioOutputChannelCaps]
+  );
+  const audioMapChannelMap = useMemo(() => {
+    const raw = Array.isArray(audioChannelMapDraft?.channelMap)
+      ? audioChannelMapDraft.channelMap
+      : (
+        Array.isArray(audioChannelMapTrack?.audio?.channelMap)
+          ? audioChannelMapTrack.audio.channelMap
+          : []
+      );
+    return Array.from({ length: audioMapSourceChannels }, (_, index) => {
+      const fallback = ((index % audioMapOutputChannelCount) + 1);
+      const value = Math.round(Number(raw[index]) || fallback);
+      return clamp(value, 1, audioMapOutputChannelCount);
+    });
+  }, [audioChannelMapDraft, audioChannelMapTrack, audioMapSourceChannels, audioMapOutputChannelCount]);
   const oscPortConflict = useMemo(() => ({
     port: Number(project.osc?.port) === DEV_SERVER_PORT,
     listenPort: Number(project.osc?.listenPort) === DEV_SERVER_PORT,
@@ -3239,6 +4285,33 @@ export default function App() {
   const canRedo = (historyFuture?.length ?? 0) > 0;
   const multiAddCount = Math.floor(Number(multiAddDialog?.count));
   const canConfirmMultiAdd = Number.isFinite(multiAddCount) && multiAddCount > 0;
+  useEffect(() => {
+    if (!audioChannelMapTrack) return;
+    probeOutputChannels(audioMapResolvedOutputDeviceId);
+  }, [audioChannelMapTrack, audioMapResolvedOutputDeviceId, probeOutputChannels]);
+
+  useEffect(() => {
+    if (!useNativeAudioEngine) {
+      nativeAudioConfigKeyRef.current = '';
+      pauseNativeAudioEngine();
+      return;
+    }
+    configureNativeAudioEngine().catch(() => {});
+  }, [useNativeAudioEngine, configureNativeAudioEngine, pauseNativeAudioEngine]);
+
+  useEffect(() => {
+    if (!useNativeAudioEngine) return;
+    if (isPlaying) {
+      playNativeAudioEngine(playheadRef.current);
+      return;
+    }
+    pauseNativeAudioEngine();
+  }, [useNativeAudioEngine, isPlaying, playNativeAudioEngine, pauseNativeAudioEngine]);
+
+  useEffect(() => {
+    if (!useNativeAudioEngine || isPlaying) return;
+    seekNativeAudioEngine(playhead);
+  }, [useNativeAudioEngine, isPlaying, playhead, seekNativeAudioEngine]);
 
   const handleUndo = () => {
     dispatch({ type: 'undo' });
@@ -3932,13 +5005,34 @@ export default function App() {
                       }
                     >
                       <option value="default">Default</option>
-                      {audioOutputs.map((device) => (
-                        <option key={device.deviceId} value={device.deviceId}>
-                          {device.label || `Output ${device.deviceId.slice(0, 6)}`}
+                      {nativeAudioStatus.available
+                        && typeof project.audio?.outputDeviceId === 'string'
+                        && project.audio.outputDeviceId
+                        && !project.audio.outputDeviceId.startsWith('native:')
+                        && project.audio.outputDeviceId !== 'default' && (
+                        <option value={project.audio.outputDeviceId}>
+                          {`Legacy Browser Device (${project.audio.outputDeviceId.slice(0, 6)})`}
                         </option>
-                      ))}
+                      )}
+                      {nativeAudioStatus.available && nativeAudioDevices.length > 0
+                        ? nativeAudioDevices.map((device) => (
+                          <option key={`native-${device.id}`} value={`native:${device.id}`}>
+                            {`${device.name} (${Math.max(Number(device.outputChannels) || 0, 2)}ch)`}
+                          </option>
+                        ))
+                        : audioOutputs.map((device) => (
+                          <option key={device.deviceId} value={device.deviceId}>
+                            {device.label || `Output ${device.deviceId.slice(0, 6)}`}
+                          </option>
+                        ))}
                     </select>
                     {audioOutputError && <div className="field__hint">{audioOutputError}</div>}
+                    {nativeAudioStatus.available && nativeAudioStatus.api && (
+                      <div className="field__hint">{`Native Audio: ${nativeAudioStatus.api}`}</div>
+                    )}
+                    {nativeAudioStatus.error && (
+                      <div className="field__hint">{nativeAudioStatus.error}</div>
+                    )}
                   </div>
                   <div className="field">
                     <label>Waveform Sample Rate (Hz)</label>
@@ -4274,6 +5368,100 @@ export default function App() {
                 </button>
                 <button className="btn btn--ghost" onClick={() => setMultiAddDialog(null)}>
                   Cancel
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {audioChannelMapTrack && (
+        <div className="modal" role="dialog" aria-modal="true">
+          <div className="modal__card modal__card--audio-map">
+            <div className="modal__header">
+              <div className="label">{`Audio Channel Map - ${audioChannelMapTrack.name}`}</div>
+            </div>
+            <div className="modal__content">
+              <div className="field">
+                <label>Output Device</label>
+                <select
+                  className="input"
+                  value={audioMapSelectedOutputDeviceId}
+                  onChange={(event) => {
+                    const nextOutputId = event.target.value || 'project-default';
+                    setAudioChannelMapDraft((prev) => ({
+                      outputDeviceId: nextOutputId,
+                      channelMap: Array.isArray(prev?.channelMap)
+                        ? prev.channelMap
+                        : audioMapChannelMap,
+                    }));
+                  }}
+                >
+                  <option value="project-default">{`Project Default (${audioMapProjectOutputLabel})`}</option>
+                  <option value="default">{`System Default (${getDetectedOutputChannels('default')}ch)`}</option>
+                  {nativeAudioStatus.available && nativeAudioDevices.map((device) => {
+                    const value = `native:${device.id}`;
+                    return (
+                      <option key={value} value={value}>
+                        {`${device.name} (${getDetectedOutputChannels(value)}ch)`}
+                      </option>
+                    );
+                  })}
+                  {audioOutputs
+                    .filter((device) => device.deviceId && device.deviceId !== 'default')
+                    .map((device) => (
+                      <option key={device.deviceId} value={device.deviceId}>
+                        {`${device.label || `Output ${device.deviceId.slice(0, 6)}`} (${getDetectedOutputChannels(device.deviceId)}ch)`}
+                      </option>
+                    ))}
+                </select>
+              </div>
+              <div className="field__hint">
+                {`Detected source channels: ${audioMapSourceChannels} | Detected output channels: ${audioMapOutputChannelCount}`}
+              </div>
+              <div className="audio-map-matrix-wrap">
+                <div
+                  className="audio-map-matrix"
+                  style={{
+                    gridTemplateColumns: `90px repeat(${audioMapOutputChannelCount}, 30px)`,
+                  }}
+                >
+                  <div className="audio-map-matrix__corner">In / Out</div>
+                  {Array.from({ length: audioMapOutputChannelCount }, (_, index) => (
+                    <div key={`audio-map-header-${index + 1}`} className="audio-map-matrix__header">
+                      {index + 1}
+                    </div>
+                  ))}
+                  {Array.from({ length: audioMapSourceChannels }, (_, rowIndex) => (
+                    <React.Fragment key={`audio-map-row-${rowIndex + 1}`}>
+                      <div className="audio-map-matrix__row-label">{`In ${rowIndex + 1}`}</div>
+                      {Array.from({ length: audioMapOutputChannelCount }, (_, columnIndex) => {
+                        const outputChannel = columnIndex + 1;
+                        const active = audioMapChannelMap[rowIndex] === outputChannel;
+                        return (
+                          <button
+                            key={`audio-map-cell-${rowIndex + 1}-${outputChannel}`}
+                            type="button"
+                            className={`audio-map-matrix__cell ${active ? 'is-active' : ''}`}
+                            onClick={() => setAudioMapRoute(rowIndex, outputChannel)}
+                          >
+                            ●
+                          </button>
+                        );
+                      })}
+                    </React.Fragment>
+                  ))}
+                </div>
+              </div>
+              <div className="field__hint">
+                QLab-style patch matrix: click dots to patch each input channel to one output channel.
+              </div>
+              <div className="modal__actions">
+                <button className="btn btn--ghost" onClick={closeAudioChannelMapDialog}>
+                  Cancel
+                </button>
+                <button className="btn" onClick={confirmAudioChannelMap}>
+                  OK
                 </button>
               </div>
             </div>
@@ -4703,7 +5891,10 @@ export default function App() {
             <div className="tracks-scroll__grid">
               <div className="track-list track-list--body">
                 <div className="track-list__body track-list__body--static">
-                  {project.tracks.map((track, index) => (
+                  {project.tracks.map((track, index) => {
+                    const meterLevel = getTrackMeterLevel(track);
+                    const meterLevelClass = getMeterLevelClass(meterLevel);
+                    return (
                     <div
                       key={track.id}
                       className={`track-row track-row--${trackInfoDensity} ${selectedTrackId === track.id ? 'is-selected' : ''} ${selectedTrackIds.includes(track.id) ? 'is-group-selected' : ''} ${dragTrackIds.includes(track.id) ? 'is-dragging' : ''} ${dropTarget?.id === track.id ? `is-drop-${dropTarget.position}` : ''}`}
@@ -4923,6 +6114,14 @@ export default function App() {
                           )}
                         </div>
                       )}
+                      {track.kind === 'audio' && (
+                        <div
+                          className={`track-row__meter ${meterLevel > 0.001 ? `is-active ${meterLevelClass}` : ''}`}
+                          aria-hidden="true"
+                        >
+                          <div className="track-row__meter-fill" style={{ width: `${Math.round(meterLevel * 100)}%` }} />
+                        </div>
+                      )}
                       <div className="track-row__controls">
                         <button
                           className={`track-pill ${track.solo ? 'is-active' : ''}`}
@@ -4966,7 +6165,8 @@ export default function App() {
                         </button>
                       </div>
                     </div>
-                  ))}
+                    );
+                  })}
                 </div>
               </div>
               <div className="timeline__lanes timeline__lanes--panel">
@@ -5038,6 +6238,7 @@ export default function App() {
             virtualMidiOutputId={VIRTUAL_MIDI_OUTPUT_ID}
             virtualMidiOutputName={VIRTUAL_MIDI_OUTPUT_NAME}
             onPatch={handlePatchTrack}
+            onOpenAudioChannelMap={openAudioChannelMapDialog}
             onNameEnterNext={handleNameEnterNext}
             onAudioFile={(file) => {
               if (!selectedTrack) return;

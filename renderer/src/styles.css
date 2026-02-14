@@ -524,6 +524,41 @@ body {
   min-width: 0;
 }
 
+.track-row__meter {
+  width: clamp(56px, calc(100% - 96px), 180px);
+  max-width: 100%;
+  height: 8px;
+  margin-top: 4px;
+  border-radius: 999px;
+  border: 1px solid rgba(93, 216, 199, 0.28);
+  background: rgba(10, 14, 24, 0.95);
+  overflow: hidden;
+}
+
+.track-row__meter-fill {
+  width: 0;
+  height: 100%;
+  border-radius: inherit;
+  background: rgba(67, 232, 125, 0.92);
+  transition: width 60ms linear, background-color 90ms ease, box-shadow 90ms ease;
+  box-shadow: 0 0 8px rgba(67, 232, 125, 0.35);
+}
+
+.track-row__meter:not(.is-active) .track-row__meter-fill {
+  opacity: 0.28;
+  box-shadow: none;
+}
+
+.track-row__meter.is-yellow .track-row__meter-fill {
+  background: rgba(252, 221, 84, 0.95);
+  box-shadow: 0 0 10px rgba(252, 221, 84, 0.4);
+}
+
+.track-row__meter.is-red .track-row__meter-fill {
+  background: rgba(255, 95, 95, 0.95);
+  box-shadow: 0 0 10px rgba(255, 95, 95, 0.45);
+}
+
 .track-row__name {
   flex: 1;
   min-width: 0;
@@ -602,6 +637,10 @@ body {
   padding-top: 8px;
   padding-bottom: 8px;
   gap: 0;
+}
+
+.track-row--compact .track-row__meter {
+  margin-top: 10px;
 }
 
 .track-row__controls {
@@ -1243,6 +1282,10 @@ body {
   width: min(760px, calc(100vw - 40px));
 }
 
+.modal__card--audio-map {
+  width: min(1000px, calc(100vw - 40px));
+}
+
 .modal__header {
   display: flex;
   justify-content: space-between;
@@ -1253,6 +1296,64 @@ body {
   display: flex;
   flex-direction: column;
   gap: 12px;
+}
+
+.audio-map-matrix-wrap {
+  max-width: 100%;
+  max-height: 52vh;
+  overflow: auto;
+  border: 1px solid var(--stroke);
+  border-radius: 10px;
+  background: rgba(10, 14, 22, 0.7);
+  padding: 8px;
+}
+
+.audio-map-matrix {
+  display: grid;
+  gap: 4px;
+  align-items: center;
+  width: max-content;
+}
+
+.audio-map-matrix__corner,
+.audio-map-matrix__header,
+.audio-map-matrix__row-label {
+  font-size: 11px;
+  color: var(--muted);
+  text-align: center;
+  font-family: 'IBM Plex Mono', monospace;
+}
+
+.audio-map-matrix__corner,
+.audio-map-matrix__row-label {
+  text-align: left;
+  padding-left: 6px;
+}
+
+.audio-map-matrix__cell {
+  border: 1px solid rgba(55, 70, 96, 0.8);
+  background: rgba(12, 15, 20, 0.82);
+  color: rgba(110, 126, 155, 0.8);
+  border-radius: 7px;
+  width: 30px;
+  height: 28px;
+  min-width: 30px;
+  flex: 0 0 auto;
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+  padding: 0;
+}
+
+.audio-map-matrix__cell:hover {
+  border-color: rgba(93, 216, 199, 0.45);
+  color: rgba(93, 216, 199, 0.75);
+}
+
+.audio-map-matrix__cell.is-active {
+  border-color: rgba(93, 216, 199, 0.8);
+  color: rgba(93, 216, 199, 0.98);
+  background: rgba(93, 216, 199, 0.16);
 }
 
 .inline-color-picker {

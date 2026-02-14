@@ -2,6 +2,9 @@ const { app, BrowserWindow, ipcMain } = require('electron');
 const path = require('path');
 const dgram = require('dgram');
 const { Worker } = require('worker_threads');
+const { execFile } = require('child_process');
+const fs = require('fs');
+const { createNativeAudioEngine } = require('./nativeAudioEngine');
 let midi = null;
 try {
   midi = require('@julusian/midi');
@@ -10,6 +13,7 @@ try {
 }
 
 const isDev = !app.isPackaged;
+const useDevServer = process.env.OSC_DAW_DEV_SERVER === '1';
 const enableDebugLog = isDev && process.env.OSC_DAW_DEBUG === '1';
 const oscSocket = dgram.createSocket('udp4');
 const artNetSocket = dgram.createSocket('udp4');
@@ -26,6 +30,15 @@ const oscRecorderPending = new Map();
 const ARTNET_DEFAULT_PORT = 6454;
 const ARTNET_CHANNEL_COUNT = 512;
 const ARTNET_PROTOCOL_VERSION = 14;
+const AUDIO_DEVICE_CACHE_TTL_MS = 8000;
+let audioOutputChannelsCache = {
+  timestamp: 0,
+  byLabel: {},
+  defaultOutputLabel: null,
+  defaultOutputChannels: 2,
+};
+let audioOutputChannelsPending = null;
+const nativeAudioEngine = createNativeAudioEngine();
 
 const align4 = (size) => (size + 3) & ~0x03;
 
@@ -112,6 +125,101 @@ const emitOscControlStatus = (status, extra = {}) => {
     timestamp: Date.now(),
     ...extra,
   });
+};
+
+const parseAudioOutputChannelsFromSystemProfiler = (stdout) => {
+  const parsed = JSON.parse(stdout || '{}');
+  const sections = Array.isArray(parsed?.SPAudioDataType) ? parsed.SPAudioDataType : [];
+  const byLabel = {};
+  let defaultOutputLabel = null;
+  let defaultOutputChannels = null;
+
+  sections.forEach((section) => {
+    const items = Array.isArray(section?._items) ? section._items : [];
+    items.forEach((item) => {
+      const name = typeof item?._name === 'string' ? item._name.trim() : '';
+      const outputChannels = Number(item?.coreaudio_device_output);
+      if (!name || !Number.isFinite(outputChannels) || outputChannels <= 0) return;
+      byLabel[name] = Math.max(1, Math.min(Math.round(outputChannels), 128));
+      if (item?.coreaudio_default_audio_output_device === 'spaudio_yes') {
+        defaultOutputLabel = name;
+        defaultOutputChannels = byLabel[name];
+      }
+    });
+  });
+
+  if (!Number.isFinite(defaultOutputChannels) || defaultOutputChannels <= 0) {
+    const first = Object.values(byLabel).find((value) => Number.isFinite(value) && value > 0);
+    defaultOutputChannels = Number.isFinite(first) ? first : 2;
+  }
+
+  return {
+    byLabel,
+    defaultOutputLabel,
+    defaultOutputChannels,
+  };
+};
+
+const getAudioOutputChannels = async () => {
+  const now = Date.now();
+  if (now - audioOutputChannelsCache.timestamp < AUDIO_DEVICE_CACHE_TTL_MS) {
+    return {
+      ok: true,
+      ...audioOutputChannelsCache,
+    };
+  }
+
+  if (audioOutputChannelsPending) {
+    return audioOutputChannelsPending;
+  }
+
+  audioOutputChannelsPending = new Promise((resolve) => {
+    if (process.platform !== 'darwin') {
+      resolve({
+        ok: false,
+        error: 'audio channel probe is only implemented on macOS',
+        ...audioOutputChannelsCache,
+      });
+      return;
+    }
+
+    execFile(
+      '/usr/sbin/system_profiler',
+      ['SPAudioDataType', '-json'],
+      { maxBuffer: 16 * 1024 * 1024 },
+      (error, stdout) => {
+        if (error) {
+          resolve({
+            ok: false,
+            error: error?.message || 'Failed to run system_profiler',
+            ...audioOutputChannelsCache,
+          });
+          return;
+        }
+        try {
+          const parsed = parseAudioOutputChannelsFromSystemProfiler(stdout);
+          audioOutputChannelsCache = {
+            timestamp: Date.now(),
+            ...parsed,
+          };
+          resolve({
+            ok: true,
+            ...audioOutputChannelsCache,
+          });
+        } catch (parseError) {
+          resolve({
+            ok: false,
+            error: parseError?.message || 'Failed to parse audio device list',
+            ...audioOutputChannelsCache,
+          });
+        }
+      }
+    );
+  }).finally(() => {
+    audioOutputChannelsPending = null;
+  });
+
+  return audioOutputChannelsPending;
 };
 
 const readOscString = (buffer, offset) => {
@@ -479,7 +587,7 @@ const createWindow = () => {
     },
   });
 
-  if (isDev) {
+  if (useDevServer) {
     win.loadURL('http://localhost:5170');
   } else {
     win.loadFile(path.join(__dirname, '..', 'dist', 'renderer', 'index.html'));
@@ -509,6 +617,62 @@ app.on('window-all-closed', () => {
 });
 
 ipcMain.handle('app:get-version', () => app.getVersion());
+ipcMain.handle('audio:get-output-channels', async () => getAudioOutputChannels());
+ipcMain.handle('audio:native-status', () => nativeAudioEngine.getStatus());
+ipcMain.handle('audio:native-devices', () => nativeAudioEngine.listDevices());
+ipcMain.handle('audio:native-configure', (_event, payload) => {
+  const sampleRate = Number(payload?.sampleRate);
+  const bufferFrames = Number(payload?.bufferFrames);
+  const outputChannels = Number(payload?.outputChannels);
+  const explicitHint = payload?.outputHint;
+  const outputHint =
+    (typeof explicitHint === 'number' && Number.isFinite(explicitHint))
+      ? explicitHint
+      : (typeof payload?.outputLabel === 'string' && payload.outputLabel.trim()
+      ? payload.outputLabel.trim()
+      : (payload?.outputId || 'default'));
+  return nativeAudioEngine.openOrReopenStream({
+    outputHint,
+    sampleRate,
+    bufferFrames,
+    outputChannels,
+  });
+});
+ipcMain.handle('audio:native-set-tracks', (_event, payload) => {
+  return nativeAudioEngine.setTracks(Array.isArray(payload?.tracks) ? payload.tracks : []);
+});
+ipcMain.handle('audio:native-play', (_event, payload) => {
+  return nativeAudioEngine.play(Number(payload?.playhead));
+});
+ipcMain.handle('audio:native-pause', () => nativeAudioEngine.pause());
+ipcMain.handle('audio:native-seek', (_event, payload) => {
+  return nativeAudioEngine.setPlayhead(Number(payload?.playhead));
+});
+ipcMain.handle('audio:native-cache-file', (_event, payload) => {
+  try {
+    const rawName = typeof payload?.name === 'string' && payload.name.trim()
+      ? payload.name.trim()
+      : 'audio.wav';
+    const safeName = rawName.replace(/[^\w.\-]+/g, '_').slice(-120) || 'audio.wav';
+    const rawBytes = payload?.bytes;
+    const bytes = rawBytes instanceof Uint8Array
+      ? rawBytes
+      : (Array.isArray(rawBytes) ? Uint8Array.from(rawBytes) : null);
+    if (!bytes || !bytes.length) {
+      return { ok: false, error: 'No file bytes provided' };
+    }
+    const tempDir = path.join(app.getPath('temp'), 'oscdaw-native-audio');
+    fs.mkdirSync(tempDir, { recursive: true });
+    const filePath = path.join(
+      tempDir,
+      `${Date.now()}-${Math.random().toString(16).slice(2, 8)}-${safeName}`
+    );
+    fs.writeFileSync(filePath, Buffer.from(bytes));
+    return { ok: true, path: filePath };
+  } catch (error) {
+    return { ok: false, error: error?.message || 'Failed to cache audio file' };
+  }
+});
 ipcMain.handle('osc:send', async (_event, payload) => {
   const host = typeof payload?.host === 'string' && payload.host.trim() ? payload.host.trim() : '127.0.0.1';
   const port = Number(payload?.port);
@@ -598,6 +762,7 @@ ipcMain.handle('midi:virtual-status', () => ({
 }));
 
 app.on('before-quit', () => {
+  nativeAudioEngine.shutdown();
   closeVirtualMidiPorts();
   closeOscListener(false).catch(() => {});
   closeOscControlListener(false).catch(() => {});

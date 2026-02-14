@@ -2,6 +2,15 @@ const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('oscDaw', {
   getVersion: () => ipcRenderer.invoke('app:get-version'),
+  getAudioOutputChannels: () => ipcRenderer.invoke('audio:get-output-channels'),
+  getNativeAudioStatus: () => ipcRenderer.invoke('audio:native-status'),
+  getNativeAudioDevices: () => ipcRenderer.invoke('audio:native-devices'),
+  configureNativeAudio: (payload) => ipcRenderer.invoke('audio:native-configure', payload),
+  setNativeAudioTracks: (payload) => ipcRenderer.invoke('audio:native-set-tracks', payload),
+  playNativeAudio: (payload) => ipcRenderer.invoke('audio:native-play', payload),
+  pauseNativeAudio: () => ipcRenderer.invoke('audio:native-pause'),
+  seekNativeAudio: (payload) => ipcRenderer.invoke('audio:native-seek', payload),
+  cacheNativeAudioFile: (payload) => ipcRenderer.invoke('audio:native-cache-file', payload),
   sendOscMessage: (payload) => ipcRenderer.invoke('osc:send', payload),
   sendArtNetFrame: (payload) => ipcRenderer.invoke('dmx:send-artnet', payload),
   startOscListening: (payload) => ipcRenderer.invoke('osc:listen-start', payload),

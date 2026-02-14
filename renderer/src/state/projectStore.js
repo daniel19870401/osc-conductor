@@ -2,6 +2,7 @@ const deepClone = (value) => JSON.parse(JSON.stringify(value));
 const clamp = (value, min, max) => Math.min(Math.max(value, min), max);
 const AUDIO_BUFFER_SIZES = [128, 256, 512, 1024, 2048, 4096, 8192, 16384];
 const HISTORY_LIMIT = 200;
+const AUDIO_TRACK_MAX_CHANNELS = 64;
 const HISTORY_ACTIONS = new Set([
   'update-project',
   'add-composition',
@@ -60,6 +61,17 @@ const DEFAULT_DMX_TRACK_SETTINGS = {
   host: '127.0.0.1',
   universe: 0,
   channel: 1,
+};
+const DEFAULT_AUDIO_TRACK_SETTINGS = {
+  src: '',
+  nativePath: '',
+  name: '',
+  duration: 0,
+  volume: 1,
+  outputDeviceId: 'project-default',
+  channels: 2,
+  channelMapEnabled: false,
+  channelMap: [1, 2],
 };
 const DEFAULT_DMX_COLOR_TRACK_SETTINGS = {
   host: '127.0.0.1',
@@ -139,6 +151,20 @@ const normalizeDmxFixtureType = (value) => (
 const normalizeMappingChannels = (value) => {
   const channels = Math.round(toFinite(value, DEFAULT_DMX_COLOR_TRACK_SETTINGS.mappingChannels));
   return channels === 3 ? 3 : 4;
+};
+
+const normalizeAudioChannels = (value, fallback = DEFAULT_AUDIO_TRACK_SETTINGS.channels) => (
+  clamp(Math.round(toFinite(value, fallback)), 1, AUDIO_TRACK_MAX_CHANNELS)
+);
+
+const normalizeAudioChannelMap = (value, channels) => {
+  const safeChannels = normalizeAudioChannels(channels, channels);
+  const raw = Array.isArray(value) ? value : [];
+  return Array.from({ length: safeChannels }, (_, index) => {
+    const fallback = index + 1;
+    const next = Math.round(toFinite(raw[index], fallback));
+    return clamp(next, 1, AUDIO_TRACK_MAX_CHANNELS);
+  });
 };
 
 const buildAutoTrackName = (address, index) => {
@@ -267,15 +293,22 @@ const normalizeTrack = (track, fallbackColor = '#5dd8c7') => {
     .sort((a, b) => a.t - b.t);
   if (next.kind === 'audio') {
     const audioSrc = typeof next.audio?.src === 'string' ? next.audio.src : '';
+    const audioNativePath = typeof next.audio?.nativePath === 'string' ? next.audio.nativePath : '';
+    const channels = normalizeAudioChannels(next.audio?.channels);
     next.audio = {
-      src: '',
-      name: '',
-      duration: 0,
-      volume: 1,
+      ...DEFAULT_AUDIO_TRACK_SETTINGS,
       ...(next.audio || {}),
       src: audioSrc.startsWith('file://') ? '' : audioSrc,
+      nativePath: audioNativePath,
       duration: Math.max(toFinite(next.audio?.duration, 0), 0),
       volume: clamp(toFinite(next.audio?.volume, 1), 0, 1),
+      outputDeviceId:
+        typeof next.audio?.outputDeviceId === 'string' && next.audio.outputDeviceId
+          ? next.audio.outputDeviceId
+          : DEFAULT_AUDIO_TRACK_SETTINGS.outputDeviceId,
+      channels,
+      channelMapEnabled: Boolean(next.audio?.channelMapEnabled),
+      channelMap: normalizeAudioChannelMap(next.audio?.channelMap, channels),
     };
   }
   return next;
@@ -475,7 +508,12 @@ const createTrack = (index, view, kind = 'osc', options = {}) => {
     nodes: [],
   };
   if (kind === 'audio') {
-    return { ...base, audio: { src: '', name: '', duration: 0, volume: 1 } };
+    return {
+      ...base,
+      audio: {
+        ...DEFAULT_AUDIO_TRACK_SETTINGS,
+      },
+    };
   }
   if (kind === 'midi') {
     const midiOptions = options.midi || {};
