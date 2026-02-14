@@ -2,10 +2,6 @@
 
 本程式全部由 AI vibe coding 產出。
 
-<p align="left">
-  <img src="docs/assets/nl-interactive-logo.png" alt="NL interactive logo" width="140" />
-</p>
-
 Electron + React 的 OSC/Audio/MIDI/DMX 時間軸控制 DAW。
 
 ## 目前封裝版本（v1.1.1）
@@ -103,6 +99,10 @@ Legacy（仍支援）：
 - `/OSCDAW/cue`
 
 ## Brand
+
+<p align="left">
+  <img src="docs/assets/nl-interactive-logo.png" alt="NL interactive logo" width="140" />
+</p>
 
 - NL Interactive
 - Copyright © NL Interactive
