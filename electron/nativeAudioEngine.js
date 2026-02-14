@@ -365,15 +365,59 @@ class NativeAudioEngine {
       });
       prepared.push({
         id: item.id,
-        volume: clamp(Number(item.volume) || 0, 0, 2),
+        volume: clamp(Number.isFinite(Number(item.volume)) ? Number(item.volume) : 1, 0, 2),
         enabled: Boolean(item.enabled),
         decoded,
+        clipStartFrames: Math.max(Math.floor((Number(item.clipStart) || 0) * this.sampleRate), 0),
         sourceChannels,
         channelMap,
       });
     }
     this.trackStates = prepared;
     return { ok: true, loadedTracks: prepared.length };
+  }
+
+  updateTrackMix(tracks) {
+    const next = Array.isArray(tracks) ? tracks : [];
+    if (!next.length || !this.trackStates.length) {
+      return { ok: true, updated: 0 };
+    }
+    const byId = new Map();
+    for (let i = 0; i < next.length; i += 1) {
+      const item = next[i] || {};
+      if (!item.id) continue;
+      byId.set(item.id, item);
+    }
+    if (!byId.size) return { ok: true, updated: 0 };
+    let updated = 0;
+    this.trackStates = this.trackStates.map((track) => {
+      const patch = byId.get(track.id);
+      if (!patch) return track;
+      const nextVolume = clamp(
+        Number.isFinite(Number(patch.volume)) ? Number(patch.volume) : track.volume,
+        0,
+        2
+      );
+      const nextEnabled = typeof patch.enabled === 'boolean' ? patch.enabled : track.enabled;
+      const nextClipStartFrames = Number.isFinite(Number(patch.clipStart))
+        ? Math.max(Math.floor(Number(patch.clipStart) * this.sampleRate), 0)
+        : track.clipStartFrames;
+      if (
+        nextVolume === track.volume
+        && nextEnabled === track.enabled
+        && nextClipStartFrames === track.clipStartFrames
+      ) {
+        return track;
+      }
+      updated += 1;
+      return {
+        ...track,
+        volume: nextVolume,
+        enabled: nextEnabled,
+        clipStartFrames: nextClipStartFrames,
+      };
+    });
+    return { ok: true, updated };
   }
 
   setPlayhead(seconds) {
@@ -395,7 +439,8 @@ class NativeAudioEngine {
         const srcMaxFrame = Math.max(src.frameCount - 1, 0);
         for (let frame = 0; frame < frameCount; frame += 1) {
           const timelineFrame = this.playheadFrames + frame;
-          const srcPos = timelineFrame * resampleRatio;
+          const trackTimelineFrame = timelineFrame - track.clipStartFrames;
+          const srcPos = trackTimelineFrame * resampleRatio;
           if (srcPos < 0 || srcPos >= src.frameCount) continue;
           const base = Math.floor(srcPos);
           const next = Math.min(base + 1, srcMaxFrame);

@@ -1,4 +1,5 @@
 import React, { useEffect, useRef } from 'react';
+import NumberInput from './NumberInput.jsx';
 
 const parseNumber = (value, fallback) => {
   const next = Number(value);
@@ -68,9 +69,9 @@ export default function InspectorPanel({
             <div className="field-grid">
               <div className="field">
                 <label>Min</label>
-                <input
+                <NumberInput
                   className="input"
-                  type="number"
+                 
                   step="0.01"
                   value={Number.isFinite(track.min) ? track.min : 0}
                   onChange={(event) => onPatch({ min: parseNumber(event.target.value, 0) })}
@@ -78,9 +79,9 @@ export default function InspectorPanel({
               </div>
               <div className="field">
                 <label>Max</label>
-                <input
+                <NumberInput
                   className="input"
-                  type="number"
+                 
                   step="0.01"
                   value={Number.isFinite(track.max) ? track.max : 1}
                   onChange={(event) => onPatch({ max: parseNumber(event.target.value, 1) })}
@@ -171,9 +172,9 @@ export default function InspectorPanel({
             <div className="field-grid">
               <div className="field">
                 <label>Channel</label>
-                <input
+                <NumberInput
                   className="input"
-                  type="number"
+                 
                   min="1"
                   max="16"
                   step="1"
@@ -203,9 +204,8 @@ export default function InspectorPanel({
               <div className="field-grid">
                 <div className="field">
                   <label>Note</label>
-                  <input
+                  <NumberInput
                     className="input"
-                    type="number"
                     min="0"
                     max="127"
                     step="1"
@@ -218,9 +218,8 @@ export default function InspectorPanel({
                 </div>
                 <div className="field">
                   <label>Velocity</label>
-                  <input
+                  <NumberInput
                     className="input"
-                    type="number"
                     min="0"
                     max="127"
                     step="1"
@@ -235,9 +234,9 @@ export default function InspectorPanel({
             ) : (
               <div className="field">
                 <label>Control Number</label>
-                <input
+                <NumberInput
                   className="input"
-                  type="number"
+                 
                   min="0"
                   max="127"
                   step="1"
@@ -276,9 +275,9 @@ export default function InspectorPanel({
             <div className="field-grid">
               <div className="field">
                 <label>Universe</label>
-                <input
+                <NumberInput
                   className="input"
-                  type="number"
+                 
                   min="0"
                   max="32767"
                   step="1"
@@ -291,9 +290,9 @@ export default function InspectorPanel({
               </div>
               <div className="field">
                 <label>Channel</label>
-                <input
+                <NumberInput
                   className="input"
-                  type="number"
+                 
                   min="1"
                   max="512"
                   step="1"
@@ -327,9 +326,9 @@ export default function InspectorPanel({
             <div className="field-grid">
               <div className="field">
                 <label>Universe</label>
-                <input
+                <NumberInput
                   className="input"
-                  type="number"
+                 
                   min="0"
                   max="32767"
                   step="1"
@@ -342,9 +341,9 @@ export default function InspectorPanel({
               </div>
               <div className="field">
                 <label>Channel Start</label>
-                <input
+                <NumberInput
                   className="input"
-                  type="number"
+                 
                   min="1"
                   max="512"
                   step="1"
@@ -425,9 +424,9 @@ export default function InspectorPanel({
                 <div className="field-grid">
                   <div className="field">
                     <label>R Map</label>
-                    <input
+                    <NumberInput
                       className="input"
-                      type="number"
+                     
                       min="1"
                       max="512"
                       step="1"
@@ -440,9 +439,9 @@ export default function InspectorPanel({
                   </div>
                   <div className="field">
                     <label>G Map</label>
-                    <input
+                    <NumberInput
                       className="input"
-                      type="number"
+                     
                       min="1"
                       max="512"
                       step="1"
@@ -457,9 +456,9 @@ export default function InspectorPanel({
                 <div className="field-grid">
                   <div className="field">
                     <label>B Map</label>
-                    <input
+                    <NumberInput
                       className="input"
-                      type="number"
+                     
                       min="1"
                       max="512"
                       step="1"
@@ -473,9 +472,9 @@ export default function InspectorPanel({
                   {Number(track.dmxColor?.mappingChannels) === 4 && (
                     <div className="field">
                       <label>W Map</label>
-                      <input
+                      <NumberInput
                         className="input"
-                        type="number"
+                       
                         min="1"
                         max="512"
                         step="1"

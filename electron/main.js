@@ -641,6 +641,9 @@ ipcMain.handle('audio:native-configure', (_event, payload) => {
 ipcMain.handle('audio:native-set-tracks', (_event, payload) => {
   return nativeAudioEngine.setTracks(Array.isArray(payload?.tracks) ? payload.tracks : []);
 });
+ipcMain.handle('audio:native-update-track-mix', (_event, payload) => {
+  return nativeAudioEngine.updateTrackMix(Array.isArray(payload?.tracks) ? payload.tracks : []);
+});
 ipcMain.handle('audio:native-play', (_event, payload) => {
   return nativeAudioEngine.play(Number(payload?.playhead));
 });

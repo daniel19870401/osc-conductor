@@ -3,6 +3,8 @@ const clamp = (value, min, max) => Math.min(Math.max(value, min), max);
 const AUDIO_BUFFER_SIZES = [128, 256, 512, 1024, 2048, 4096, 8192, 16384];
 const HISTORY_LIMIT = 200;
 const AUDIO_TRACK_MAX_CHANNELS = 64;
+const DEFAULT_PROJECT_LENGTH_SECONDS = 3600;
+const DEFAULT_VIEW_SPAN_SECONDS = 8;
 const HISTORY_ACTIONS = new Set([
   'update-project',
   'add-composition',
@@ -67,6 +69,7 @@ const DEFAULT_AUDIO_TRACK_SETTINGS = {
   nativePath: '',
   name: '',
   duration: 0,
+  clipStart: 0,
   volume: 1,
   outputDeviceId: 'project-default',
   channels: 2,
@@ -301,6 +304,7 @@ const normalizeTrack = (track, fallbackColor = '#5dd8c7') => {
       src: audioSrc.startsWith('file://') ? '' : audioSrc,
       nativePath: audioNativePath,
       duration: Math.max(toFinite(next.audio?.duration, 0), 0),
+      clipStart: Math.max(toFinite(next.audio?.clipStart, 0), 0),
       volume: clamp(toFinite(next.audio?.volume, 1), 0, 1),
       outputDeviceId:
         typeof next.audio?.outputDeviceId === 'string' && next.audio.outputDeviceId
@@ -319,7 +323,7 @@ const createCueId = () => `cue-${Date.now()}-${Math.random().toString(16).slice(
 const createCompositionId = () => `composition-${Date.now()}-${Math.random().toString(16).slice(2, 6)}`;
 
 const normalizeView = (view) => {
-  const length = Math.max(toFinite(view.length, 120), 1);
+  const length = Math.max(toFinite(view.length, DEFAULT_PROJECT_LENGTH_SECONDS), 1);
   const startRaw = Math.max(toFinite(view.start, 0), 0);
   const endRaw = Math.max(toFinite(view.end, startRaw + 1), startRaw + 1);
   const span = Math.max(endRaw - startRaw, 1);
@@ -392,7 +396,12 @@ const syncActiveCompositionInProject = (project) => {
 };
 
 const normalizeProject = (project) => {
-  const fallbackView = normalizeView(project.view || { start: 0, end: 8, length: 120, trackHeight: 96 });
+  const fallbackView = normalizeView(project.view || {
+    start: 0,
+    end: DEFAULT_VIEW_SPAN_SECONDS,
+    length: DEFAULT_PROJECT_LENGTH_SECONDS,
+    trackHeight: 96,
+  });
   const fallbackCues = normalizeCues(project.cues, fallbackView.length);
   const fallbackTracks = normalizeTracks(project.tracks);
   const audio = {
@@ -654,8 +663,8 @@ export const createInitialState = () => {
     },
     view: {
       start: 0,
-      end: 8,
-      length: 120,
+      end: DEFAULT_VIEW_SPAN_SECONDS,
+      length: DEFAULT_PROJECT_LENGTH_SECONDS,
       trackHeight: 96,
     },
     cues: [],
@@ -895,10 +904,15 @@ const reduceProjectState = (state, action) => {
       return { ...state, selectedTrackId: action.id };
     case 'add-composition': {
       const syncedProject = syncActiveCompositionInProject(state.project);
-      const sourceView = normalizeView(syncedProject.view || { start: 0, end: 8, length: 120, trackHeight: 96 });
+      const sourceView = normalizeView(syncedProject.view || {
+        start: 0,
+        end: DEFAULT_VIEW_SPAN_SECONDS,
+        length: DEFAULT_PROJECT_LENGTH_SECONDS,
+        trackHeight: 96,
+      });
       const view = normalizeView({
         start: 0,
-        end: Math.min(8, sourceView.length),
+        end: Math.min(DEFAULT_VIEW_SPAN_SECONDS, sourceView.length),
         length: sourceView.length,
         trackHeight: sourceView.trackHeight,
       });

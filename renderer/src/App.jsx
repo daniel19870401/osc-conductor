@@ -4,6 +4,7 @@ import TimelineHeader from './components/TimelineHeader.jsx';
 import TrackLane from './components/TrackLane.jsx';
 import InspectorPanel from './components/InspectorPanel.jsx';
 import InlineColorPicker from './components/InlineColorPicker.jsx';
+import NumberInput from './components/NumberInput.jsx';
 import nlInteractiveLogo from './assets/nl-interactive-logo.png';
 import { createInitialState, projectReducer } from './state/projectStore.js';
 import { Decoder as LtcDecoder } from 'linear-timecode';
@@ -273,6 +274,7 @@ export default function App() {
   const [selectedNodeContext, setSelectedNodeContext] = useState({ trackId: null, nodeIds: [] });
   const [editingNode, setEditingNode] = useState(null);
   const [editingCue, setEditingCue] = useState(null);
+  const [editingAudioClip, setEditingAudioClip] = useState(null);
   const [audioChannelMapTrackId, setAudioChannelMapTrackId] = useState(null);
   const [audioChannelMapDraft, setAudioChannelMapDraft] = useState(null);
   const [audioOutputs, setAudioOutputs] = useState([]);
@@ -348,6 +350,7 @@ export default function App() {
   const midiTrackRuntimeRef = useRef(new Map());
   const artNetSequenceRef = useRef(new Map());
   const nativeAudioConfigKeyRef = useRef('');
+  const nativeAudioMixKeyRef = useRef('');
   const [audioWaveforms, setAudioWaveforms] = useState({});
 
   const compositions = useMemo(
@@ -1503,7 +1506,7 @@ export default function App() {
         const cues = (Array.isArray(cueList) ? cueList : []).slice().sort((a, b) => a.t - b.t);
         const targetCue = cues[cueNumber - 1];
         if (!targetCue) return;
-        const safeView = view || { start: 0, end: 8, length: 120 };
+        const safeView = view || { start: 0, end: 8, length: 3600 };
         const cueTime = clamp(Number(targetCue.t) || 0, 0, Math.max(Number(safeView.length) || 0, 0));
         if (isPlayingRef.current && (syncModeRef.current || 'Internal') === 'Internal') {
           startInternalClock(cueTime);
@@ -1658,6 +1661,10 @@ export default function App() {
     return Boolean(track.solo);
   };
 
+  const getAudioClipStart = (track) => (
+    Math.max(Number(track?.audio?.clipStart) || 0, 0)
+  );
+
   const getTrackMeterLevel = (track) => {
     if (!track) return 0;
     const kind = track.kind;
@@ -1675,9 +1682,12 @@ export default function App() {
           ? track.audio.waveformDuration
           : (Number.isFinite(track.audio?.duration) && track.audio.duration > 0 ? track.audio.duration : 0));
       const volume = clamp(Number(track.audio?.volume ?? 1), 0, 1);
+      const clipStart = getAudioClipStart(track);
+      const localTime = playhead - clipStart;
+      if (localTime < 0 || (duration > 0 && localTime > duration)) return 0;
       if (peaks.length > 1 && duration > 0) {
-        const safeTime = clamp(playhead, 0, duration);
-        const progress = safeTime / duration;
+        const safeTime = clamp(localTime, 0, duration);
+        const progress = safeTime / Math.max(duration, 0.000001);
         const peakIndex = clamp(Math.round(progress * (peaks.length - 1)), 0, peaks.length - 1);
         const peak = clamp(Number(peaks[peakIndex]) || 0, 0, 1);
         return clamp(Math.sqrt(peak) * volume, 0, 1);
@@ -2226,6 +2236,18 @@ export default function App() {
     return Math.max(project.view.length || 0, 0.1);
   };
 
+  const getAudioTrackTiming = (track, audio, timelineTime) => {
+    const duration = getTrackAudioDuration(track, audio);
+    const clipStart = getAudioClipStart(track);
+    const localTime = Number(timelineTime) - clipStart;
+    return {
+      duration,
+      clipStart,
+      localTime,
+      inRange: localTime >= 0 && localTime < duration,
+    };
+  };
+
   const seekAudioElement = (track, audio, time) => {
     if (!track || !audio) return;
     const duration = getTrackAudioDuration(track, audio);
@@ -2293,6 +2315,7 @@ export default function App() {
         return {
           id: track.id,
           filePath,
+          clipStart: getAudioClipStart(track),
           volume: clamp(Number.isFinite(track.audio?.volume) ? track.audio.volume : 1, 0, 1),
           enabled: isTrackEnabled(track, 'audio'),
           outputDeviceId:
@@ -2312,6 +2335,15 @@ export default function App() {
   const useNativeAudioEngine = Boolean(
     nativeAudioStatus.available
     && nativeAudioTrackDescriptors.length > 0
+  );
+  const nativeAudioTrackMixDescriptors = useMemo(
+    () => nativeAudioTrackDescriptors.map((track) => ({
+      id: track.id,
+      clipStart: track.clipStart,
+      volume: track.volume,
+      enabled: track.enabled,
+    })),
+    [nativeAudioTrackDescriptors]
   );
 
   const resolveNativeOutputId = useCallback((rawOutputId) => {
@@ -2387,8 +2419,6 @@ export default function App() {
       tracks: tracksPayload.tracks.map((track) => ({
         id: track.id,
         filePath: track.filePath,
-        volume: track.volume,
-        enabled: track.enabled,
         sourceChannels: track.sourceChannels,
         channelMap: track.channelMap,
       })),
@@ -2426,16 +2456,33 @@ export default function App() {
       setNativeAudioStatus((prev) => (prev.error ? { ...prev, error: null } : prev));
     }
     nativeAudioConfigKeyRef.current = nextConfigKey;
+    nativeAudioMixKeyRef.current = '';
+    if (isPlayingRef.current && bridge?.playNativeAudio) {
+      await bridge.playNativeAudio({ playhead: clamp(Number(playheadRef.current) || 0, 0, project.view.length) });
+    }
   }, [
     useNativeAudioEngine,
     project.audio?.outputDeviceId,
     project.audio?.sampleRate,
     project.audio?.bufferSize,
+    project.view.length,
     audioOutputLabelById,
     nativeAudioDevices,
     nativeAudioTrackDescriptors,
     resolveNativeOutputId,
   ]);
+
+  const syncNativeAudioTrackMix = useCallback(async () => {
+    if (!useNativeAudioEngine) return;
+    const bridge = window.oscDaw;
+    if (!bridge?.updateNativeAudioTrackMix) return;
+    const payload = { tracks: nativeAudioTrackMixDescriptors };
+    const nextKey = JSON.stringify(payload.tracks);
+    if (nativeAudioMixKeyRef.current === nextKey) return;
+    const result = await bridge.updateNativeAudioTrackMix(payload);
+    if (!result?.ok) return;
+    nativeAudioMixKeyRef.current = nextKey;
+  }, [useNativeAudioEngine, nativeAudioTrackMixDescriptors]);
 
   const seekNativeAudioEngine = useCallback((time) => {
     if (!useNativeAudioEngine) return;
@@ -2477,7 +2524,16 @@ export default function App() {
       const audio = getAudioElement(track);
       if (!audio) return;
       audio.pause();
-      seekAudioElement(track, audio, time);
+      const timing = getAudioTrackTiming(track, audio, time);
+      if (timing.localTime <= 0) {
+        seekAudioElement(track, audio, 0);
+        return;
+      }
+      if (timing.localTime >= timing.duration) {
+        seekAudioElement(track, audio, Math.max(timing.duration - 0.001, 0));
+        return;
+      }
+      seekAudioElement(track, audio, timing.localTime);
     });
   };
 
@@ -2653,12 +2709,6 @@ export default function App() {
         },
       },
     });
-    if (duration > 0) {
-      dispatch({
-        type: 'update-project',
-        patch: { view: { length: duration } },
-      });
-    }
   };
 
   useEffect(() => {
@@ -2771,16 +2821,25 @@ export default function App() {
         }
       }
       if (isPlaying) {
-        const duration = getTrackAudioDuration(track, audio);
-        const safePlayhead = clamp(playhead, 0, Math.max(duration - 0.001, 0));
-        const drift = Math.abs(audio.currentTime - safePlayhead);
-        if (Number.isFinite(drift) && drift > 0.25) {
-          seekAudioElement(track, audio, safePlayhead);
-        }
-        if (audio.paused) {
-          const result = audio.play();
-          if (result && typeof result.catch === 'function') {
-            result.catch(() => {});
+        const timing = getAudioTrackTiming(track, audio, playhead);
+        if (!timing.inRange) {
+          if (timing.localTime <= 0) {
+            seekAudioElement(track, audio, 0);
+          } else {
+            seekAudioElement(track, audio, Math.max(timing.duration - 0.001, 0));
+          }
+          audio.pause();
+        } else {
+          const safeLocalTime = clamp(timing.localTime, 0, Math.max(timing.duration - 0.001, 0));
+          const drift = Math.abs(audio.currentTime - safeLocalTime);
+          if (Number.isFinite(drift) && drift > 0.25) {
+            seekAudioElement(track, audio, safeLocalTime);
+          }
+          if (audio.paused) {
+            const result = audio.play();
+            if (result && typeof result.catch === 'function') {
+              result.catch(() => {});
+            }
           }
         }
       } else {
@@ -3377,6 +3436,13 @@ export default function App() {
         }
         return;
       }
+      if (editingAudioClip) {
+        if (event.key === 'Escape') {
+          event.preventDefault();
+          setEditingAudioClip(null);
+        }
+        return;
+      }
       const key = event.key?.toLowerCase();
       const withCommand = event.metaKey || event.ctrlKey;
       if (withCommand && key === 'c') {
@@ -3591,6 +3657,7 @@ export default function App() {
     isHelpOpen,
     multiAddDialog,
     audioChannelMapTrackId,
+    editingAudioClip,
     isPlaying,
     playhead,
     selectedTrackId,
@@ -4025,7 +4092,17 @@ export default function App() {
           routing.context.resume().catch(() => {});
         }
       }
-      seekAudioElement(track, audio, playhead);
+      const timing = getAudioTrackTiming(track, audio, playhead);
+      if (!timing.inRange) {
+        if (timing.localTime < 0) {
+          seekAudioElement(track, audio, 0);
+        } else {
+          seekAudioElement(track, audio, Math.max(timing.duration - 0.001, 0));
+        }
+        audio.pause();
+        return;
+      }
+      seekAudioElement(track, audio, timing.localTime);
       const result = audio.play();
       if (result && typeof result.catch === 'function') {
         result.catch(() => {});
@@ -4061,6 +4138,31 @@ export default function App() {
 
   const handleScroll = (start) => {
     dispatch({ type: 'scroll-time', start });
+  };
+
+  const handleAudioClipMove = (trackId, clipStart) => {
+    if (!trackId) return;
+    dispatch({
+      type: 'update-track',
+      id: trackId,
+      patch: {
+        audio: {
+          clipStart: clamp(Number(clipStart) || 0, 0, project.view.length),
+        },
+      },
+    });
+  };
+
+  const handleEditAudioClipStart = (trackId, clipStart) => {
+    const safeStart = clamp(Number(clipStart) || 0, 0, project.view.length);
+    const parts = secondsToHmsfParts(safeStart, syncFpsPreset.fps);
+    setEditingAudioClip({
+      trackId,
+      hours: String(parts.hours),
+      minutes: String(parts.minutes),
+      seconds: String(parts.seconds),
+      frames: String(parts.frames),
+    });
   };
 
   const handleSaveNodeValue = () => {
@@ -4107,6 +4209,19 @@ export default function App() {
     );
     dispatch({ type: 'update-cue', id: editingCue.id, time });
     setEditingCue(null);
+  };
+
+  const handleSaveAudioClipStart = () => {
+    if (!editingAudioClip) return;
+    const time = hmsfPartsToSeconds(
+      Number(editingAudioClip.hours) || 0,
+      Number(editingAudioClip.minutes) || 0,
+      Number(editingAudioClip.seconds) || 0,
+      Number(editingAudioClip.frames) || 0,
+      syncFpsPreset.fps
+    );
+    handleAudioClipMove(editingAudioClip.trackId, time);
+    setEditingAudioClip(null);
   };
 
   const handleSave = () => {
@@ -4194,7 +4309,7 @@ export default function App() {
       const target = event.target;
       const tag = target?.tagName?.toLowerCase();
       if (tag === 'input' || tag === 'textarea' || target?.isContentEditable) return;
-      if (isSettingsOpen || isHelpOpen || editingNode || editingCue || audioChannelMapTrackId) return;
+      if (isSettingsOpen || isHelpOpen || editingNode || editingCue || editingAudioClip || audioChannelMapTrackId) return;
 
       const delta = getWheelDelta(event);
       if (delta === 0) return;
@@ -4213,7 +4328,7 @@ export default function App() {
     return () => {
       window.removeEventListener('wheel', handleWheelZoom);
     };
-  }, [isSettingsOpen, isHelpOpen, editingNode, editingCue, audioChannelMapTrackId, playhead]);
+  }, [isSettingsOpen, isHelpOpen, editingNode, editingCue, editingAudioClip, audioChannelMapTrackId, playhead]);
 
   const currentTime = useMemo(
     () => formatHmsfTimecode(playhead, syncFpsPreset.fps),
@@ -4294,11 +4409,20 @@ export default function App() {
   useEffect(() => {
     if (!useNativeAudioEngine) {
       nativeAudioConfigKeyRef.current = '';
+      nativeAudioMixKeyRef.current = '';
       pauseNativeAudioEngine();
       return;
     }
     configureNativeAudioEngine().catch(() => {});
   }, [useNativeAudioEngine, configureNativeAudioEngine, pauseNativeAudioEngine]);
+
+  useEffect(() => {
+    if (!useNativeAudioEngine) {
+      nativeAudioMixKeyRef.current = '';
+      return;
+    }
+    syncNativeAudioTrackMix().catch(() => {});
+  }, [useNativeAudioEngine, syncNativeAudioTrackMix]);
 
   useEffect(() => {
     if (!useNativeAudioEngine) return;
@@ -4644,12 +4768,22 @@ export default function App() {
                 <div className="help-shortcuts__row"><kbd>Double Click Node</kbd><span>Edit node value / color</span></div>
                 <div className="help-shortcuts__row"><kbd>Drag Node</kbd><span>Move node in time/value</span></div>
                 <div className="help-shortcuts__row"><kbd>Alt/Option + Drag Node</kbd><span>Snap node to nearest cue</span></div>
+                <div className="help-shortcuts__row"><kbd>Drag Audio Clip</kbd><span>Move clip start time on timeline</span></div>
+                <div className="help-shortcuts__row"><kbd>Alt/Option + Drag Audio Clip</kbd><span>Snap clip start to nearest cue</span></div>
+                <div className="help-shortcuts__row"><kbd>Double Click Audio Clip</kbd><span>Edit clip start time</span></div>
                 <div className="help-shortcuts__row"><kbd>Right Click Node</kbd><span>Change node curve mode</span></div>
                 <div className="help-shortcuts__row"><kbd>Color Swatch</kbd><span>Apply color to selected track group</span></div>
                 <div className="help-shortcuts__row"><kbd>Shift + Click Track</kbd><span>Select track range (anchor to clicked track)</span></div>
                 <div className="help-shortcuts__row"><kbd>Ctrl/Cmd + Click Track</kbd><span>Toggle individual track selection</span></div>
                 <div className="help-shortcuts__row"><kbd>Shift + Alt/Option + Wheel</kbd><span>Zoom T</span></div>
                 <div className="help-shortcuts__row"><kbd>Shift + Ctrl + Wheel</kbd><span>Zoom H</span></div>
+              </div>
+
+              <div className="help-shortcuts__section">
+                <div className="help-shortcuts__title">Project / Audio Notes</div>
+                <div className="help-shortcuts__row"><kbd>New Project</kbd><span>Default project length is 01:00:00.00</span></div>
+                <div className="help-shortcuts__row"><kbd>Import Audio Clip</kbd><span>Does not auto-change project length</span></div>
+                <div className="help-shortcuts__row"><kbd>Audio Clip Display</kbd><span>Clip head stays aligned with timeline at all zoom levels</span></div>
               </div>
 
               <div className="help-shortcuts__section">
@@ -4738,9 +4872,9 @@ export default function App() {
                     </div>
                     <div className="field">
                       <label>FPS (OSC Send Rate)</label>
-                      <input
+                      <NumberInput
                         className="input"
-                        type="number"
+                       
                         min="1"
                         max="240"
                         step="1"
@@ -4756,9 +4890,9 @@ export default function App() {
                     <div className="field">
                       <label>Project Length (hh:mm:ss.ff)</label>
                       <div className="field-grid field-grid--quad">
-                        <input
+                        <NumberInput
                           className="input"
-                          type="number"
+                         
                           min="0"
                           step="1"
                           placeholder="hh"
@@ -4780,9 +4914,9 @@ export default function App() {
                             })
                           }
                         />
-                        <input
+                        <NumberInput
                           className="input"
-                          type="number"
+                         
                           min="0"
                           max="59"
                           step="1"
@@ -4805,9 +4939,9 @@ export default function App() {
                             })
                           }
                         />
-                        <input
+                        <NumberInput
                           className="input"
-                          type="number"
+                         
                           min="0"
                           max="59"
                           step="1"
@@ -4830,9 +4964,9 @@ export default function App() {
                             })
                           }
                         />
-                        <input
+                        <NumberInput
                           className="input"
-                          type="number"
+                         
                           min="0"
                           max={Math.max(Math.round(syncFpsPreset.fps) - 1, 0)}
                           step="1"
@@ -4919,9 +5053,9 @@ export default function App() {
                   </div>
                   <div className="field">
                     <label>OSC Port</label>
-                    <input
+                    <NumberInput
                       className="input"
-                      type="number"
+                     
                       min="1"
                       max="65535"
                       step="1"
@@ -4941,9 +5075,9 @@ export default function App() {
                   </div>
                   <div className="field">
                     <label>OSC Listening Port</label>
-                    <input
+                    <NumberInput
                       className="input"
-                      type="number"
+                     
                       min="1"
                       max="65535"
                       step="1"
@@ -4966,9 +5100,9 @@ export default function App() {
                   </div>
                   <div className="field">
                     <label>OSC Control Port</label>
-                    <input
+                    <NumberInput
                       className="input"
-                      type="number"
+                     
                       min="1"
                       max="65535"
                       step="1"
@@ -5041,9 +5175,9 @@ export default function App() {
                   </div>
                   <div className="field">
                     <label>Waveform Sample Rate (Hz)</label>
-                    <input
+                    <NumberInput
                       className="input"
-                      type="number"
+                     
                       min="8000"
                       max="192000"
                       step="1000"
@@ -5097,9 +5231,9 @@ export default function App() {
                   </div>
                   <div className="field">
                     <label>LTC Sync Channel</label>
-                    <input
+                    <NumberInput
                       className="input"
-                      type="number"
+                     
                       min="1"
                       max="64"
                       step="1"
@@ -5139,9 +5273,9 @@ export default function App() {
             <div className="modal__content">
               <div className="field">
                 <label>Track Count</label>
-                <input
+                <NumberInput
                   className="input"
-                  type="number"
+                 
                   min="1"
                   max="256"
                   step="1"
@@ -5177,9 +5311,9 @@ export default function App() {
                   <div className="field-grid">
                     <div className="field">
                       <label>Universe</label>
-                      <input
+                      <NumberInput
                         className="input"
-                        type="number"
+                       
                         min="0"
                         max="32767"
                         step="1"
@@ -5194,9 +5328,9 @@ export default function App() {
                     </div>
                     <div className="field">
                       <label>Start Channel</label>
-                      <input
+                      <NumberInput
                         className="input"
-                        type="number"
+                       
                         min="1"
                         max="512"
                         step="1"
@@ -5257,9 +5391,9 @@ export default function App() {
                       )}
                       <div className="field">
                         <label>Interval Channels</label>
-                        <input
+                        <NumberInput
                           className="input"
-                          type="number"
+                         
                           min="1"
                           max="512"
                           step="1"
@@ -5309,9 +5443,9 @@ export default function App() {
                   <div className="field-grid">
                     <div className="field">
                       <label>Channel</label>
-                      <input
+                      <NumberInput
                         className="input"
-                        type="number"
+                       
                         min="1"
                         max="16"
                         step="1"
@@ -5342,9 +5476,9 @@ export default function App() {
                   </div>
                   <div className="field">
                     <label>{multiAddDialog.midiMode === 'note' ? 'Start Note' : 'Start CC'}</label>
-                    <input
+                    <NumberInput
                       className="input"
-                      type="number"
+                     
                       min="0"
                       max="127"
                       step="1"
@@ -5505,9 +5639,8 @@ export default function App() {
               ) : (
                 <div className="field">
                   <label>Value</label>
-                  <input
+                  <NumberInput
                     className="input"
-                    type="number"
                     step="0.01"
                     value={editingNode.value}
                     onChange={(event) => setEditingNode({ ...editingNode, value: event.target.value })}
@@ -5533,9 +5666,8 @@ export default function App() {
               <div className="field">
                 <label>Time (hh:mm:ss.ff)</label>
                 <div className="field-grid field-grid--quad">
-                  <input
+                  <NumberInput
                     className="input"
-                    type="number"
                     min="0"
                     step="1"
                     placeholder="hh"
@@ -5547,9 +5679,8 @@ export default function App() {
                       })
                     }
                   />
-                  <input
+                  <NumberInput
                     className="input"
-                    type="number"
                     min="0"
                     step="1"
                     placeholder="mm"
@@ -5561,9 +5692,8 @@ export default function App() {
                       })
                     }
                   />
-                  <input
+                  <NumberInput
                     className="input"
-                    type="number"
                     min="0"
                     max="59"
                     step="1"
@@ -5576,9 +5706,8 @@ export default function App() {
                       })
                     }
                   />
-                  <input
+                  <NumberInput
                     className="input"
-                    type="number"
                     min="0"
                     max={Math.max(Math.round(syncFpsPreset.fps) - 1, 0)}
                     step="1"
@@ -5596,6 +5725,82 @@ export default function App() {
               <div className="modal__actions">
                 <button className="btn" onClick={handleSaveCueTime}>Save</button>
                 <button className="btn btn--ghost" onClick={() => setEditingCue(null)}>Cancel</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {editingAudioClip && (
+        <div className="modal" role="dialog" aria-modal="true">
+          <div className="modal__card">
+            <div className="modal__header">
+              <div className="label">Edit Audio Clip Start</div>
+            </div>
+            <div className="modal__content">
+              <div className="field">
+                <label>Start (hh:mm:ss.ff)</label>
+                <div className="field-grid field-grid--quad">
+                  <NumberInput
+                    className="input"
+                    min="0"
+                    step="1"
+                    placeholder="hh"
+                    value={editingAudioClip.hours}
+                    onChange={(event) =>
+                      setEditingAudioClip({
+                        ...editingAudioClip,
+                        hours: event.target.value,
+                      })
+                    }
+                  />
+                  <NumberInput
+                    className="input"
+                    min="0"
+                    max="59"
+                    step="1"
+                    placeholder="mm"
+                    value={editingAudioClip.minutes}
+                    onChange={(event) =>
+                      setEditingAudioClip({
+                        ...editingAudioClip,
+                        minutes: event.target.value,
+                      })
+                    }
+                  />
+                  <NumberInput
+                    className="input"
+                    min="0"
+                    max="59"
+                    step="1"
+                    placeholder="ss"
+                    value={editingAudioClip.seconds}
+                    onChange={(event) =>
+                      setEditingAudioClip({
+                        ...editingAudioClip,
+                        seconds: event.target.value,
+                      })
+                    }
+                  />
+                  <NumberInput
+                    className="input"
+                    min="0"
+                    max={Math.max(Math.round(syncFpsPreset.fps) - 1, 0)}
+                    step="1"
+                    placeholder="ff"
+                    value={editingAudioClip.frames}
+                    onChange={(event) =>
+                      setEditingAudioClip({
+                        ...editingAudioClip,
+                        frames: event.target.value,
+                      })
+                    }
+                  />
+                </div>
+              </div>
+              <div className="modal__actions">
+                <button className="btn" onClick={handleSaveAudioClipStart}>Save</button>
+                <button className="btn btn--ghost" onClick={() => setEditingAudioClip(null)}>Cancel</button>
               </div>
             </div>
           </div>
@@ -6191,6 +6396,8 @@ export default function App() {
                     onAddNode={handleAddNode}
                     onEditNode={handleEditNode}
                     onSelectionChange={handleNodeSelectionChange}
+                    onMoveAudioClip={handleAudioClipMove}
+                    onEditAudioClipStart={handleEditAudioClipStart}
                     audioWaveform={audioWaveforms[track.id]}
                   />
                 ))}

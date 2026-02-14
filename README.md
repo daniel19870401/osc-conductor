@@ -4,13 +4,13 @@
 
 Electron + React 的 OSC/Audio/MIDI/DMX 時間軸控制 DAW。
 
-## 目前封裝版本（v1.1.2）
+## 目前封裝版本（v1.1.3）
 
 位於 `release/`：
 
-- `OSCDAW-1.1.2-win-x64.exe`（Windows Intel x64）
-- `OSCDAW-1.1.2-win-arm64.exe`（Windows ARM64）
-- `OSCDAW-1.1.2-arm64-mac.zip`（macOS Apple Silicon）
+- `OSCDAW-1.1.3-win-x64.exe`（Windows Intel x64）
+- `OSCDAW-1.1.3-win-arm64.exe`（Windows ARM64）
+- `OSCDAW-1.1.3-arm64-mac.zip`（macOS Apple Silicon）
 
 ## 開發
 
@@ -75,6 +75,12 @@ npx electron-builder --mac zip --arm64 --config.mac.identity=null --publish neve
 - `Ctrl/Cmd + 點 Track`：間隔多選
 - `Shift + Alt/Option + 滾輪`：Zoom T
 - `Shift + Ctrl + 滾輪`：Zoom H
+
+### Project / Audio Notes
+
+- 新專案預設長度：`01:00:00.00`
+- 載入 Audio Clip 不會自動改變 Project Length
+- Audio Clip 在時間軸極小縮放時，Clip 開頭仍會與時間軸對齊
 
 ### OSC Remote Control
 

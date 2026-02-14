@@ -7,6 +7,7 @@ contextBridge.exposeInMainWorld('oscDaw', {
   getNativeAudioDevices: () => ipcRenderer.invoke('audio:native-devices'),
   configureNativeAudio: (payload) => ipcRenderer.invoke('audio:native-configure', payload),
   setNativeAudioTracks: (payload) => ipcRenderer.invoke('audio:native-set-tracks', payload),
+  updateNativeAudioTrackMix: (payload) => ipcRenderer.invoke('audio:native-update-track-mix', payload),
   playNativeAudio: (payload) => ipcRenderer.invoke('audio:native-play', payload),
   pauseNativeAudio: () => ipcRenderer.invoke('audio:native-pause'),
   seekNativeAudio: (payload) => ipcRenderer.invoke('audio:native-seek', payload),
