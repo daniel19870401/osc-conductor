@@ -4,13 +4,13 @@
 
 Electron + React 的 OSC/Audio/MIDI/DMX 時間軸控制 DAW。
 
-## 目前封裝版本（v1.1.1）
+## 目前封裝版本（v1.1.2）
 
 位於 `release/`：
 
-- `OSCDAW-1.1.1-win-x64.exe`（Windows Intel x64）
-- `OSCDAW-1.1.1-win-arm64.exe`（Windows ARM64）
-- `OSCDAW-1.1.1-arm64-mac.zip`（macOS Apple Silicon）
+- `OSCDAW-1.1.2-win-x64.exe`（Windows Intel x64）
+- `OSCDAW-1.1.2-win-arm64.exe`（Windows ARM64）
+- `OSCDAW-1.1.2-arm64-mac.zip`（macOS Apple Silicon）
 
 ## 開發
 
