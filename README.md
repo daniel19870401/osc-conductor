@@ -1,14 +1,20 @@
 # OSCDAW
 
+本程式全部由 AI vibe coding 產出。
+
+<p align="left">
+  <img src="docs/assets/nl-interactive-logo.png" alt="NL interactive logo" width="140" />
+</p>
+
 Electron + React 的 OSC/Audio/MIDI/DMX 時間軸控制 DAW。
 
-## 目前封裝版本（v1.0.0）
+## 目前封裝版本（v1.1.1）
 
 位於 `release/`：
 
-- `OSCDAW-win-x64.exe`（Windows Intel x64）
-- `OSCDAW-win-arm64.exe`（Windows ARM64）
-- `OSCDAW-mac-arm64.zip`（macOS Apple Silicon）
+- `OSCDAW-1.1.1-win-x64.exe`（Windows Intel x64）
+- `OSCDAW-1.1.1-win-arm64.exe`（Windows ARM64）
+- `OSCDAW-1.1.1-arm64-mac.zip`（macOS Apple Silicon）
 
 ## 開發
 
@@ -24,9 +30,9 @@ npm run dev
 
 ```bash
 npm run build
-npx electron-builder --win portable --x64 --config.win.signAndEditExecutable=false --config.artifactName='${productName}-${os}-${arch}.${ext}'
-npx electron-builder --win portable --arm64 --config.win.signAndEditExecutable=false --config.artifactName='${productName}-${os}-${arch}.${ext}'
-npx electron-builder --mac zip --arm64 --config.mac.identity=null --config.artifactName='${productName}-${os}-${arch}.${ext}'
+npx electron-builder --win portable --x64 --config.win.signAndEditExecutable=false --publish never
+npx electron-builder --win portable --arm64 --config.win.signAndEditExecutable=false --publish never
+npx electron-builder --mac zip --arm64 --config.mac.identity=null --publish never
 ```
 
 ## Help（快捷鍵 / 控制）
@@ -44,11 +50,16 @@ npx electron-builder --mac zip --arm64 --config.mac.identity=null --config.artif
 - `Cmd/Ctrl + A`：新增 Audio Track
 - `Cmd/Ctrl + M`：新增 MIDI Track
 - `Cmd/Ctrl + D`：新增 DMX Track
+- `Cmd/Ctrl + Shift + D`：新增 DMX Color Track
 - `Cmd/Ctrl + C`：複製選取 Track 或 Node
 - `Cmd/Ctrl + V`：貼上 Track，或在播放軸貼上 Node
 - `Cmd/Ctrl + Z`：Undo
 - `Cmd/Ctrl + Shift + Z`：Redo
 - `Cmd/Ctrl + Y`：Redo（替代）
+- `Enter（Audio Channel Map）`：儲存目前 mapping 並跳下一個 Audio Track
+- `↓（Audio Channel Map）`：儲存目前 mapping 並跳下一個 Audio Track
+- `Top Bar: Comps`：顯示 / 隱藏 Composition 面板
+- `Top Bar: Inspector`：顯示 / 隱藏 Inspector 面板
 - `Esc`：關閉 Help
 
 ### Mouse
@@ -59,11 +70,11 @@ npx electron-builder --mac zip --arm64 --config.mac.identity=null --config.artif
 - 雙擊 Composition：改名
 - 拖拉 Composition：改順序
 - `Alt/Option + 點擊 Track 的 +`：開啟 Multi Add（一次新增多軌）
-- 雙擊 Node：編輯數值
+- 雙擊 Node：編輯數值 / 顏色
 - 拖拉 Node：改時間與數值
 - `Alt/Option + 拖拉 Node`：吸附到最近 Cue
 - 右鍵 Node：切換曲線模式
-- 點擊色塊：套用 Track 顏色
+- 點擊色塊：套用 Track 顏色（可對多選軌道）
 - `Shift + 點 Track`：範圍選取
 - `Ctrl/Cmd + 點 Track`：間隔多選
 - `Shift + Alt/Option + 滾輪`：Zoom T

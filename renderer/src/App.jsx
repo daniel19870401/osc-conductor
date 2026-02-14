@@ -3268,7 +3268,10 @@ export default function App() {
     const handleKeydown = (event) => {
       const target = event.target;
       const tag = target?.tagName?.toLowerCase();
-      if (tag === 'input' || tag === 'textarea' || target?.isContentEditable) return;
+      const isPlainEnter = event.key === 'Enter' && !event.shiftKey && !event.altKey && !event.ctrlKey && !event.metaKey;
+      const isPlainArrowDown = event.key === 'ArrowDown' && !event.shiftKey && !event.altKey && !event.ctrlKey && !event.metaKey;
+      const isAudioMapAdvanceKey = Boolean(audioChannelMapTrackId) && (isPlainEnter || isPlainArrowDown);
+      if (!isAudioMapAdvanceKey && (tag === 'input' || tag === 'textarea' || target?.isContentEditable)) return;
       if (isHelpOpen) {
         if (event.key === 'Escape') {
           event.preventDefault();
@@ -3290,8 +3293,6 @@ export default function App() {
           setAudioChannelMapDraft(null);
           return;
         }
-        const isPlainEnter = event.key === 'Enter' && !event.shiftKey && !event.altKey && !event.ctrlKey && !event.metaKey;
-        const isPlainArrowDown = event.key === 'ArrowDown' && !event.shiftKey && !event.altKey && !event.ctrlKey && !event.metaKey;
         if (isPlainEnter || isPlainArrowDown) {
           event.preventDefault();
           const currentTrack = project.tracks.find(
@@ -4625,6 +4626,8 @@ export default function App() {
                 <div className="help-shortcuts__row"><kbd>Cmd/Ctrl + Z</kbd><span>Undo</span></div>
                 <div className="help-shortcuts__row"><kbd>Cmd/Ctrl + Shift + Z</kbd><span>Redo</span></div>
                 <div className="help-shortcuts__row"><kbd>Cmd/Ctrl + Y</kbd><span>Redo (alternative)</span></div>
+                <div className="help-shortcuts__row"><kbd>Enter (Audio Channel Map)</kbd><span>Save map and jump to next Audio track</span></div>
+                <div className="help-shortcuts__row"><kbd>↓ (Audio Channel Map)</kbd><span>Save map and jump to next Audio track</span></div>
                 <div className="help-shortcuts__row"><kbd>Top Bar: Comps</kbd><span>Show / Hide compositions panel</span></div>
                 <div className="help-shortcuts__row"><kbd>Top Bar: Inspector</kbd><span>Show / Hide inspector panel</span></div>
                 <div className="help-shortcuts__row"><kbd>Esc</kbd><span>Close this help dialog</span></div>
