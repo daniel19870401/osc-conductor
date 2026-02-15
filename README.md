@@ -127,4 +127,6 @@ Composition index 為 1-based（依左側 Composition 清單順序）。
 
 如果這個專案對你有幫助，歡迎小額捐款支持：
 
-![OSConductor Donate QRCode](docs/assets/osconductor-donate-qrcode.png)
+<p align="left">
+  <img src="docs/assets/osconductor-donate-qrcode.png" alt="OSConductor Donate QRCode" width="280" />
+</p>
