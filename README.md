@@ -142,12 +142,8 @@ Composition index 為 1-based（依左側 Composition 清單順序）。
 ## Donate
 
 如果這個專案對你有幫助，歡迎小額捐款支持：
-<div id="paypal-container-B8R33FUJXCSYQ"></div>
-<script>
-  paypal.HostedButtons({
-    hostedButtonId: "B8R33FUJXCSYQ",
-  }).render("#paypal-container-B8R33FUJXCSYQ")
-</script>
+
+https://www.paypal.com/ncp/payment/B8R33FUJXCSYQ
 
 <p align="left">
   <img src="docs/assets/osconductor-donate-qrcode.png" alt="OSConductor Donate QRCode" width="280" />
