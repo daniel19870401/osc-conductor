@@ -142,9 +142,11 @@ Composition index 為 1-based（依左側 Composition 清單順序）。
 ## Donate
 
 如果這個專案對你有幫助，歡迎小額捐款支持：
-
-<script 
-  src="https://www.paypal.com/sdk/js?client-id=BAAGQjjnAX3hNGbC_Dyqs-SLAerzSUToSF9IYArL23G0EFpT7kbhJocMA67HdscBBq0h1AEJZtFiFV83do&components=hosted-buttons&disable-funding=venmo&currency=USD">
+<div id="paypal-container-B8R33FUJXCSYQ"></div>
+<script>
+  paypal.HostedButtons({
+    hostedButtonId: "B8R33FUJXCSYQ",
+  }).render("#paypal-container-B8R33FUJXCSYQ")
 </script>
 
 <p align="left">
