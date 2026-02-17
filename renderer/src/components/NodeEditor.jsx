@@ -40,7 +40,9 @@ export default function NodeEditor({
   onSelectionChange,
 }) {
   const { nodes, min, max } = track;
-  const isOscFlag = track.kind === 'osc-flag';
+  const isOscFlagTrack = track.kind === 'osc-flag';
+  const isMidiPc = track.kind === 'midi-pc';
+  const isFlagLike = isOscFlagTrack || isMidiPc;
   const isMidiNote = track.kind === 'midi-note';
   const range = max - min || 1;
   const svgRef = useRef(null);
@@ -114,7 +116,7 @@ export default function NodeEditor({
   };
 
   const mapNodeY = (node) => {
-    if (!isOscFlag) return mapValue(node?.v);
+    if (!isFlagLike) return mapValue(node?.v);
     const raw = Number(node?.y);
     const yNorm = Number.isFinite(raw) ? clamp(raw, 0, 1) : 0.5;
     return height - TIMELINE_PADDING - yNorm * (height - 2 * TIMELINE_PADDING);
@@ -157,6 +159,11 @@ export default function NodeEditor({
   );
 
   const formatOscFlagBadgeText = (node) => {
+    if (isMidiPc) {
+      const channel = clamp(Math.round(Number(track.midi?.channel) || 1), 1, 16);
+      const program = clamp(Math.round(Number(node?.v) || 0), 0, 127);
+      return `Ch ${channel} · PC ${program}`;
+    }
     const fallbackAddress =
       typeof track.oscAddress === 'string' && track.oscAddress.trim()
         ? track.oscAddress.trim()
@@ -235,7 +242,7 @@ export default function NodeEditor({
   }, [suspendRendering, nodes, view.start, view.end, contentWidth, selectedIds, draggingIds]);
 
   const curvePath = useMemo(() => {
-    if (isMidiNote) return '';
+    if (isMidiNote || isMidiPc) return '';
     if (!displayedNodes.length) return '';
     if (displayedNodes.length === 1) {
       const x = mapTimeToLocalX(displayedNodes[0].t);
@@ -275,7 +282,7 @@ export default function NodeEditor({
       }
     }
     return commands.join(' ');
-  }, [displayedNodes, view.start, view.end, min, max, height, contentWidth, isMidiNote, curveFps]);
+  }, [displayedNodes, view.start, view.end, min, max, height, contentWidth, isMidiNote, isMidiPc, curveFps]);
 
   const gridLines = useMemo(
     () => Array.from({ length: 9 }, (_, index) => (
@@ -350,7 +357,7 @@ export default function NodeEditor({
       mode: 'nodes',
       start,
       startTime: timeFromX(start.x),
-      startValue: isOscFlag ? normalizedFlagYFromPixel(start.y) : valueFromY(start.y),
+      startValue: isFlagLike ? normalizedFlagYFromPixel(start.y) : valueFromY(start.y),
       activeIds,
       origin,
       moved: false,
@@ -386,7 +393,7 @@ export default function NodeEditor({
 
     if (drag.mode === 'nodes') {
       const deltaT = timeFromX(current.x) - drag.startTime;
-      const deltaV = isOscFlag
+      const deltaV = isFlagLike
         ? normalizedFlagYFromPixel(current.y) - drag.startValue
         : valueFromY(current.y) - drag.startValue;
       const snapTimeThreshold =
@@ -409,7 +416,7 @@ export default function NodeEditor({
           t = clamp(nearestCue.time, 0, view.length ?? view.end);
         }
       }
-        if (isOscFlag) {
+        if (isFlagLike) {
           onNodeDrag(id, {
             t,
             y: clamp((Number.isFinite(base.y) ? base.y : 0.5) + deltaV, 0, 1),
@@ -502,11 +509,20 @@ export default function NodeEditor({
     event.stopPropagation();
     if (onSelectTrack) onSelectTrack(track.id);
     const { x, y } = getPointerPosition(event);
-    if (isOscFlag) {
+    if (isOscFlagTrack) {
       onAddNode({
         t: timeFromX(x),
         v: 1,
         d: 1,
+        y: normalizedFlagYFromPixel(y),
+        curve: 'linear',
+      });
+      return;
+    }
+    if (isMidiPc) {
+      onAddNode({
+        t: timeFromX(x),
+        v: clamp(Math.round(Number(track.default) || 0), 0, 127),
         y: normalizedFlagYFromPixel(y),
         curve: 'linear',
       });
@@ -581,7 +597,7 @@ export default function NodeEditor({
           y2={TIMELINE_PADDING}
           className="node-editor__axis"
         />
-        {!isOscFlag && !isMidiNote && <path d={curvePath} className="node-editor__curve" />}
+        {!isFlagLike && !isMidiNote && <path d={curvePath} className="node-editor__curve" />}
         {Number.isFinite(snapGuide) && (
           <line
             x1={mapTimeToLocalX(snapGuide)}
@@ -620,7 +636,7 @@ export default function NodeEditor({
               onDoubleClick={(event) => handleNodeDoubleClick(event, node)}
               onContextMenu={(event) => handleNodeContextMenu(event, node.id)}
             >
-              {isOscFlag ? (
+              {isFlagLike ? (
                 <g transform={`translate(${nodeX}, ${nodeY})`} data-node-id={node.id}>
                   <rect
                     data-node-id={node.id}
@@ -716,7 +732,7 @@ export default function NodeEditor({
             </g>
           );
         })}
-        {!isOscFlag && displayedNodes.map((node) => {
+        {!isFlagLike && displayedNodes.map((node) => {
           if (!selectedSet.has(node.id) && !draggingIds.includes(node.id)) return null;
           const label = isMidiNote
             ? `${Math.max(0, Math.min(127, Math.round(Number(node.v) || 0)))} ${formatMidiNoteLabel(node.v)}`
@@ -740,7 +756,7 @@ export default function NodeEditor({
             </g>
           );
         })}
-        {!isOscFlag && (
+        {!isFlagLike && (
           <>
             <text x={TIMELINE_PADDING} y={TIMELINE_PADDING - 4} className="node-editor__label">max {max}</text>
             <text x={TIMELINE_PADDING} y={height - 2} className="node-editor__label">min {min}</text>
@@ -761,8 +777,8 @@ export default function NodeEditor({
           >
             Delete Node
           </button>
-          {!isOscFlag && !isMidiNote && <div className="node-context-menu__separator" />}
-          {!isOscFlag && !isMidiNote && CURVE_MENU_ITEMS.map((item, index) => {
+          {!isFlagLike && !isMidiNote && <div className="node-context-menu__separator" />}
+          {!isFlagLike && !isMidiNote && CURVE_MENU_ITEMS.map((item, index) => {
             if (item.separator) {
               return <div key={`sep-${index}`} className="node-context-menu__separator" />;
             }

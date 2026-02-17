@@ -192,10 +192,11 @@ body {
 .tracks-pane {
   display: grid;
   grid-template-columns: var(--track-list-width) minmax(0, 1fr);
-  grid-template-rows: auto 1fr auto;
+  grid-template-rows: auto 1fr auto auto;
   grid-template-areas:
     "trackHeader timelineHeader"
     "trackScroll trackScroll"
+    "timelineScroll timelineScroll"
     "zoomFooter zoomFooter";
   gap: 12px;
   min-height: 0;
@@ -1140,6 +1141,27 @@ body {
   cursor: pointer;
 }
 
+.timeline-scroll-dock {
+  grid-area: timelineScroll;
+  display: grid;
+  grid-template-columns: var(--track-list-width) minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
+  padding: 8px 12px;
+  border: 1px solid var(--stroke);
+  border-radius: 12px;
+  background: rgba(13, 17, 26, 0.84);
+  box-shadow: 0 10px 20px rgba(0, 0, 0, 0.2);
+}
+
+.timeline-scroll-dock__lane {
+  min-width: 0;
+}
+
+.timeline-scroll--dock {
+  margin: 0;
+}
+
 .timeline-scroll::-moz-range-thumb {
   width: 22px;
   height: 12px;
@@ -1335,6 +1357,40 @@ body {
 
 .audio-lane__clip-hit:active {
   cursor: grabbing;
+}
+
+.audio-lane__trim-handle {
+  fill: rgba(255, 255, 255, 0.06);
+  stroke: rgba(180, 210, 255, 0.45);
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+
+.audio-lane__trim-handle--left,
+.audio-lane__trim-handle--right {
+  cursor: ew-resize;
+}
+
+.audio-lane__fade {
+  fill: rgba(255, 207, 114, 0.18);
+  stroke: rgba(255, 207, 114, 0.55);
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+  cursor: ew-resize;
+}
+
+.audio-lane__fade-handle {
+  stroke: rgba(255, 207, 114, 0.95);
+  stroke-width: 1.2;
+  vector-effect: non-scaling-stroke;
+  cursor: ew-resize;
+}
+
+.audio-lane__fade-curve-handle {
+  fill: rgba(255, 207, 114, 0.9);
+  stroke: rgba(28, 32, 44, 0.8);
+  stroke-width: 1;
+  cursor: ns-resize;
 }
 
 .audio-lane__empty {
@@ -2547,6 +2603,7 @@ body {
       "trackHeader"
       "timelineHeader"
       "trackScroll"
+      "timelineScroll"
       "zoomFooter";
   }
 
@@ -2557,6 +2614,14 @@ body {
 
   .tracks-scroll__grid {
     grid-template-columns: 1fr;
+  }
+
+  .timeline-scroll-dock {
+    grid-template-columns: 1fr;
+  }
+
+  .timeline-scroll-dock__spacer {
+    display: none;
   }
 
   .midi-monitor {

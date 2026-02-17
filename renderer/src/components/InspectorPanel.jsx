@@ -320,6 +320,78 @@ export default function InspectorPanel({
               <span className="inspector__value">{Array.isArray(track.nodes) ? track.nodes.length : 0}</span>
             </div>
           </div>
+        ) : track.kind === 'midi-pc' ? (
+          <div className="inspector__section" key="midi-pc-inspector">
+            <div className="inspector__title">MIDI Program Change</div>
+            <div className="field">
+              <label>MIDI Out Port</label>
+              <select
+                className="input"
+                value={typeof track.midi?.outputId === 'string' && track.midi.outputId
+                  ? track.midi.outputId
+                  : virtualMidiOutputId}
+                onChange={(event) =>
+                  onPatch({
+                    midi: { outputId: event.target.value },
+                  })}
+              >
+                <option value={virtualMidiOutputId}>{virtualMidiOutputName}</option>
+                {safeMidiOutputs
+                  .filter((device) => device.id !== virtualMidiOutputId)
+                  .map((device) => (
+                    <option key={device.id} value={device.id}>
+                      {device.name}
+                    </option>
+                  ))}
+              </select>
+            </div>
+            <div className="field-grid">
+              <div className="field">
+                <label>Channel</label>
+                <NumberInput
+                  className="input"
+                  min="1"
+                  max="16"
+                  step="1"
+                  value={Number.isFinite(track.midi?.channel) ? track.midi.channel : 1}
+                  onChange={(event) =>
+                    onPatch({
+                      midi: { channel: parseNumber(event.target.value, 1) },
+                    })}
+                />
+              </div>
+              <div className="field">
+                <label>Program Change</label>
+                <NumberInput
+                  className="input"
+                  min="0"
+                  max="127"
+                  step="1"
+                  value={selectedNode
+                    ? (Number.isFinite(selectedNode.v) ? selectedNode.v : 0)
+                    : (Number.isFinite(track.midi?.program) ? track.midi.program : 0)}
+                  onChange={(event) => {
+                    const nextProgram = Math.max(0, Math.min(127, Math.round(parseNumber(event.target.value, 0))));
+                    if (selectedNode && onPatchNode) {
+                      onPatchNode(selectedNode.id, { v: nextProgram });
+                      return;
+                    }
+                    onPatch({
+                      midi: { program: nextProgram },
+                      default: nextProgram,
+                    });
+                  }}
+                />
+              </div>
+            </div>
+            <div className="field__hint">
+              Flag-style nodes trigger MIDI Program Change at node time.
+            </div>
+            <div className="inspector__row">
+              <span>Nodes</span>
+              <span className="inspector__value">{Array.isArray(track.nodes) ? track.nodes.length : 0}</span>
+            </div>
+          </div>
         ) : track.kind === 'dmx' ? (
           <div className="inspector__section" key="dmx-inspector">
             <div className="inspector__title">DMX (Art-Net)</div>

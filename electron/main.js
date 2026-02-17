@@ -15,6 +15,9 @@ try {
 const isDev = !app.isPackaged;
 const useDevServer = process.env.OSCONDUCTOR_DEV_SERVER === '1';
 const enableDebugLog = isDev && process.env.OSCONDUCTOR_DEBUG === '1';
+app.commandLine.appendSwitch('disable-background-timer-throttling');
+app.commandLine.appendSwitch('disable-renderer-backgrounding');
+app.commandLine.appendSwitch('disable-backgrounding-occluded-windows');
 const oscSocket = dgram.createSocket('udp4');
 const artNetSocket = dgram.createSocket('udp4');
 let oscListenPort = null;
@@ -610,8 +613,11 @@ const createWindow = () => {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
+      backgroundThrottling: false,
     },
   });
+
+  win.webContents.setBackgroundThrottling(false);
 
   win.webContents.on('before-input-event', (event, input) => {
     if (!input || input.type !== 'keyDown') return;

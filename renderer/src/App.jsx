@@ -138,6 +138,97 @@ const toDmxValue = (value, fallback = 0) => {
   return clamp(Math.round(safe), 0, 255);
 };
 
+const AUDIO_FADE_SHAPE_OPTIONS = [
+  { id: 'linear', label: 'Linear' },
+  { id: 'ease-in', label: 'Ease In' },
+  { id: 'ease-out', label: 'Ease Out' },
+  { id: 'ease-in-out', label: 'Ease In/Out' },
+  { id: 's-curve', label: 'S Curve' },
+  { id: 'exp', label: 'Exponential' },
+  { id: 'log', label: 'Logarithmic' },
+];
+
+const normalizeAudioFadeShape = (value) => {
+  const next = typeof value === 'string' ? value.trim().toLowerCase() : 'linear';
+  return AUDIO_FADE_SHAPE_OPTIONS.some((item) => item.id === next) ? next : 'linear';
+};
+
+const resolveAudioTrimRange = (durationRaw, trimInRaw, trimOutRaw) => {
+  const duration = Math.max(Number(durationRaw) || 0, 0);
+  if (duration <= 0) {
+    return { trimIn: 0, trimOut: 0, clipDuration: 0 };
+  }
+  const minSpan = Math.min(0.01, duration);
+  const trimIn = clamp(Number(trimInRaw) || 0, 0, duration);
+  const parsedTrimOut = Number(trimOutRaw);
+  const rawTrimOut = Number.isFinite(parsedTrimOut) && parsedTrimOut > 0 ? parsedTrimOut : duration;
+  let trimOut = clamp(rawTrimOut, 0, duration);
+  if (trimOut <= trimIn) {
+    trimOut = clamp(trimIn + minSpan, 0, duration);
+  }
+  return {
+    trimIn,
+    trimOut,
+    clipDuration: Math.max(trimOut - trimIn, 0),
+  };
+};
+
+const getAudioCurvePower = (curvatureRaw) => {
+  const curvature = clamp(Number(curvatureRaw) || 0, -1, 1);
+  if (curvature >= 0) return 1 + curvature * 6;
+  return 1 / (1 + Math.abs(curvature) * 6);
+};
+
+const evaluateAudioFadeCurve = (progressRaw, shapeRaw = 'linear', curvatureRaw = 0) => {
+  const progress = clamp(Number(progressRaw) || 0, 0, 1);
+  const shape = normalizeAudioFadeShape(shapeRaw);
+  const power = getAudioCurvePower(curvatureRaw);
+  switch (shape) {
+    case 'ease-in':
+      return Math.pow(progress, 2 * power);
+    case 'ease-out':
+      return 1 - Math.pow(1 - progress, 2 * power);
+    case 'ease-in-out':
+      if (progress <= 0.5) return 0.5 * Math.pow(progress * 2, 2 * power);
+      return 1 - 0.5 * Math.pow((1 - progress) * 2, 2 * power);
+    case 's-curve': {
+      const smooth = progress * progress * (3 - 2 * progress);
+      return smooth;
+    }
+    case 'exp': {
+      return Math.pow(progress, power + 0.6);
+    }
+    case 'log': {
+      return 1 - Math.pow(1 - progress, power + 0.6);
+    }
+    case 'linear':
+    default:
+      return Math.pow(progress, power);
+  }
+};
+
+const computeAudioFadeGain = (track, localTime, clipDuration) => {
+  if (!track || track.kind !== 'audio') return 1;
+  const duration = Math.max(Number(clipDuration) || 0, 0);
+  if (duration <= 0) return 1;
+  const audio = track.audio || {};
+  const fadeInEnabled = Boolean(audio.fadeInEnabled);
+  const fadeOutEnabled = Boolean(audio.fadeOutEnabled);
+  const fadeInDuration = clamp(Number(audio.fadeInDuration) || 0, 0, duration);
+  const fadeOutDuration = clamp(Number(audio.fadeOutDuration) || 0, 0, duration);
+  let gain = 1;
+  if (fadeInEnabled && fadeInDuration > 0) {
+    const inProgress = clamp((Number(localTime) || 0) / fadeInDuration, 0, 1);
+    gain *= evaluateAudioFadeCurve(inProgress, audio.fadeInShape, audio.fadeInCurvature);
+  }
+  if (fadeOutEnabled && fadeOutDuration > 0) {
+    const fromEnd = duration - (Number(localTime) || 0);
+    const outProgress = clamp(1 - fromEnd / fadeOutDuration, 0, 1);
+    gain *= 1 - evaluateAudioFadeCurve(outProgress, audio.fadeOutShape, -(audio.fadeOutCurvature || 0));
+  }
+  return clamp(gain, 0, 1);
+};
+
 const normalizeOscAddressPath = (value, fallback = '/osc/value') => {
   const raw = typeof value === 'string' ? value.trim() : '';
   if (!raw) return fallback;
@@ -738,6 +829,7 @@ export default function App() {
   const [editingCue, setEditingCue] = useState(null);
   const [editingLoopRange, setEditingLoopRange] = useState(null);
   const [editingAudioClip, setEditingAudioClip] = useState(null);
+  const [editingAudioFade, setEditingAudioFade] = useState(null);
   const [audioChannelMapTrackId, setAudioChannelMapTrackId] = useState(null);
   const [audioChannelMapDraft, setAudioChannelMapDraft] = useState(null);
   const [audioOutputs, setAudioOutputs] = useState([]);
@@ -815,9 +907,12 @@ export default function App() {
   const midiInputRef = useRef(null);
   const midiOutputRef = useRef(null);
   const midiTrackRuntimeRef = useRef(new Map());
+  const midiPcRuntimeRef = useRef(new Map());
   const midiNoteRuntimeRef = useRef(new Map());
   const artNetSequenceRef = useRef(new Map());
   const oscFlagPlaybackRef = useRef({ lastTime: null });
+  const midiPcPlaybackRef = useRef({ lastTime: null });
+  const lastAudioLoopWatchPlayheadRef = useRef(null);
   const nativeAudioConfigKeyRef = useRef('');
   const nativeAudioMixKeyRef = useRef('');
   const osc3dMonitorWindowsRef = useRef(new Map());
@@ -988,7 +1083,7 @@ export default function App() {
     [project.tracks]
   );
   const selectedInspectorNode = useMemo(() => {
-    if (!selectedTrack || selectedTrack.kind !== 'osc-flag') return null;
+    if (!selectedTrack || (selectedTrack.kind !== 'osc-flag' && selectedTrack.kind !== 'midi-pc')) return null;
     if (selectedNodeContext.trackId !== selectedTrack.id) return null;
     if (!Array.isArray(selectedNodeContext.nodeIds) || selectedNodeContext.nodeIds.length !== 1) return null;
     const nodeId = selectedNodeContext.nodeIds[0];
@@ -1377,6 +1472,39 @@ export default function App() {
   useEffect(() => {
     isPlayingRef.current = isPlaying;
   }, [isPlaying]);
+
+  useEffect(() => {
+    const current = clamp(Number(playhead) || 0, 0, project.view.length);
+    const previous = lastAudioLoopWatchPlayheadRef.current;
+    lastAudioLoopWatchPlayheadRef.current = current;
+    if (!isPlaying) return;
+    if (!Number.isFinite(previous)) return;
+    if (!project.view.loopEnabled) return;
+
+    const fps = Math.max(Number(project.timebase?.fps) || 30, 1);
+    const epsilon = Math.max(2 / fps, 0.02);
+    if (current >= previous - epsilon) return;
+
+    const loopStart = clamp(Number(project.view.loopStart) || 0, 0, project.view.length);
+    const loopEnd = clamp(Number(project.view.loopEnd) || 0, 0, project.view.length);
+    const loopSpan = loopEnd - loopStart;
+    if (loopSpan <= 0.0001) return;
+
+    const nearEnd = previous >= loopEnd - Math.max(4 / fps, 0.08);
+    const nearStart = current <= loopStart + Math.max(4 / fps, 0.08);
+    if (!nearEnd && !nearStart) return;
+
+    // Keep audio engine locked to playhead when timeline wraps in loop mode.
+    syncAudioToPlayhead(current);
+  }, [
+    isPlaying,
+    playhead,
+    project.view.length,
+    project.view.loopEnabled,
+    project.view.loopStart,
+    project.view.loopEnd,
+    project.timebase?.fps,
+  ]);
 
   useEffect(() => {
     syncModeRef.current = project.timebase?.sync || 'Internal';
@@ -2635,16 +2763,19 @@ export default function App() {
           : (Number.isFinite(track.audio?.duration) && track.audio.duration > 0 ? track.audio.duration : 0));
       const volume = clamp(Number(track.audio?.volume ?? 1), 0, 1);
       const clipStart = getAudioClipStart(track);
+      const trim = resolveAudioTrimRange(duration, track.audio?.trimIn, track.audio?.trimOut);
       const localTime = playhead - clipStart;
-      if (localTime < 0 || (duration > 0 && localTime > duration)) return 0;
+      if (localTime < 0 || localTime > trim.clipDuration) return 0;
       if (peaks.length > 1 && duration > 0) {
-        const safeTime = clamp(localTime, 0, duration);
-        const progress = safeTime / Math.max(duration, 0.000001);
+        const sourceTime = clamp(trim.trimIn + localTime, trim.trimIn, trim.trimOut);
+        const progress = sourceTime / Math.max(duration, 0.000001);
         const peakIndex = clamp(Math.round(progress * (peaks.length - 1)), 0, peaks.length - 1);
         const peak = clamp(Number(peaks[peakIndex]) || 0, 0, 1);
-        return clamp(Math.sqrt(peak) * volume, 0, 1);
+        const fadeGain = computeAudioFadeGain(track, localTime, trim.clipDuration);
+        return clamp(Math.sqrt(peak) * volume * fadeGain, 0, 1);
       }
-      return clamp(volume * 0.2, 0, 1);
+      const fadeGain = computeAudioFadeGain(track, localTime, trim.clipDuration);
+      return clamp(volume * 0.2 * fadeGain, 0, 1);
     }
 
     const min = Number.isFinite(track.min) ? track.min : 0;
@@ -3191,12 +3322,18 @@ export default function App() {
   const getAudioTrackTiming = (track, audio, timelineTime) => {
     const duration = getTrackAudioDuration(track, audio);
     const clipStart = getAudioClipStart(track);
+    const trim = resolveAudioTrimRange(duration, track?.audio?.trimIn, track?.audio?.trimOut);
     const localTime = Number(timelineTime) - clipStart;
+    const sourceTime = trim.trimIn + localTime;
     return {
       duration,
       clipStart,
+      trimIn: trim.trimIn,
+      trimOut: trim.trimOut,
+      clipDuration: trim.clipDuration,
       localTime,
-      inRange: localTime >= 0 && localTime < duration,
+      sourceTime,
+      inRange: localTime >= 0 && localTime < trim.clipDuration,
     };
   };
 
@@ -3264,11 +3401,26 @@ export default function App() {
         const channelMap = channelMapEnabled
           ? mapped
           : Array.from({ length: sourceChannels }, (_, index) => index + 1);
+        const trim = resolveAudioTrimRange(
+          Number(track.audio?.duration) || 0,
+          track.audio?.trimIn,
+          track.audio?.trimOut
+        );
         return {
           id: track.id,
           filePath,
           clipStart: getAudioClipStart(track),
+          trimIn: trim.trimIn,
+          trimOut: trim.trimOut,
           volume: clamp(Number.isFinite(track.audio?.volume) ? track.audio.volume : 1, 0, 1),
+          fadeInEnabled: Boolean(track.audio?.fadeInEnabled),
+          fadeOutEnabled: Boolean(track.audio?.fadeOutEnabled),
+          fadeInDuration: clamp(Number(track.audio?.fadeInDuration) || 0, 0, trim.clipDuration),
+          fadeOutDuration: clamp(Number(track.audio?.fadeOutDuration) || 0, 0, trim.clipDuration),
+          fadeInShape: normalizeAudioFadeShape(track.audio?.fadeInShape),
+          fadeOutShape: normalizeAudioFadeShape(track.audio?.fadeOutShape),
+          fadeInCurvature: clamp(Number(track.audio?.fadeInCurvature) || 0, -1, 1),
+          fadeOutCurvature: clamp(Number(track.audio?.fadeOutCurvature) || 0, -1, 1),
           enabled: isTrackEnabled(track, 'audio'),
           outputDeviceId:
             typeof track.audio?.outputDeviceId === 'string' && track.audio.outputDeviceId
@@ -3292,7 +3444,17 @@ export default function App() {
     () => nativeAudioTrackDescriptors.map((track) => ({
       id: track.id,
       clipStart: track.clipStart,
+      trimIn: track.trimIn,
+      trimOut: track.trimOut,
       volume: track.volume,
+      fadeInEnabled: track.fadeInEnabled,
+      fadeOutEnabled: track.fadeOutEnabled,
+      fadeInDuration: track.fadeInDuration,
+      fadeOutDuration: track.fadeOutDuration,
+      fadeInShape: track.fadeInShape,
+      fadeOutShape: track.fadeOutShape,
+      fadeInCurvature: track.fadeInCurvature,
+      fadeOutCurvature: track.fadeOutCurvature,
       enabled: track.enabled,
     })),
     [nativeAudioTrackDescriptors]
@@ -3477,15 +3639,15 @@ export default function App() {
       if (!audio) return;
       audio.pause();
       const timing = getAudioTrackTiming(track, audio, time);
-      if (timing.localTime <= 0) {
-        seekAudioElement(track, audio, 0);
+      if (timing.sourceTime <= timing.trimIn) {
+        seekAudioElement(track, audio, timing.trimIn);
         return;
       }
-      if (timing.localTime >= timing.duration) {
-        seekAudioElement(track, audio, Math.max(timing.duration - 0.001, 0));
+      if (timing.sourceTime >= timing.trimOut) {
+        seekAudioElement(track, audio, Math.max(timing.trimOut - 0.001, timing.trimIn));
         return;
       }
-      seekAudioElement(track, audio, timing.localTime);
+      seekAudioElement(track, audio, timing.sourceTime);
     });
   };
 
@@ -3540,6 +3702,16 @@ export default function App() {
           nativePath,
           name: file.name,
           duration: initialDuration,
+          trimIn: 0,
+          trimOut: initialDuration,
+          fadeInEnabled: false,
+          fadeOutEnabled: false,
+          fadeInDuration: 0,
+          fadeOutDuration: 0,
+          fadeInShape: 'linear',
+          fadeOutShape: 'linear',
+          fadeInCurvature: 0,
+          fadeOutCurvature: 0,
           channels: sourceChannels,
           waveformPeaks: placeholderPeaks,
           waveformDuration: initialDuration,
@@ -3655,6 +3827,16 @@ export default function App() {
           nativePath,
           name: file.name,
           duration,
+          trimIn: 0,
+          trimOut: duration,
+          fadeInEnabled: false,
+          fadeOutEnabled: false,
+          fadeInDuration: 0,
+          fadeOutDuration: 0,
+          fadeInShape: 'linear',
+          fadeOutShape: 'linear',
+          fadeInCurvature: 0,
+          fadeOutCurvature: 0,
           channels: sourceChannels,
           waveformPeaks: peaks,
           waveformDuration: duration,
@@ -3696,11 +3878,15 @@ export default function App() {
         const loopEnd = clamp(Number(project.view.loopEnd) || 0, 0, project.view.length);
         const loopSpan = Math.max(loopEnd - loopStart, 0);
         let next = internalClockRef.current.startPlayhead + elapsed;
-        if (loopEnabled && loopSpan > 0.0001 && next >= loopStart) {
-          if (next >= loopEnd) {
-            next = loopStart + ((next - loopStart) % loopSpan);
+        let wrappedByLoop = false;
+        if (loopEnabled && loopSpan > 0.0001) {
+          const crossedLoopEnd = prev < loopEnd && next >= loopEnd;
+          if (crossedLoopEnd) {
+            next = loopStart + ((next - loopEnd) % loopSpan);
+            wrappedByLoop = true;
           }
-        } else if (next >= project.view.length) {
+        }
+        if (!wrappedByLoop && next >= project.view.length) {
           next = project.view.length;
           setIsPlaying(false);
           stopInternalClock();
@@ -3773,7 +3959,9 @@ export default function App() {
       const audio = getAudioElement(track);
       if (!audio) return;
       const enabled = isTrackEnabled(track, 'audio');
-      const targetVolume = enabled ? clamp(track.audio?.volume ?? 1, 0, 1) : 0;
+      const timing = getAudioTrackTiming(track, audio, playhead);
+      const fadeGain = computeAudioFadeGain(track, timing.localTime, timing.clipDuration);
+      const targetVolume = enabled ? clamp(track.audio?.volume ?? 1, 0, 1) * fadeGain : 0;
       const routing = ensureMappedAudioRouting(track, audio);
       const routingActive = Boolean(routing?.gainNode && routing.context?.state === 'running');
       if (routingActive) {
@@ -3804,19 +3992,22 @@ export default function App() {
         }
       }
       if (isPlaying) {
-        const timing = getAudioTrackTiming(track, audio, playhead);
         if (!timing.inRange) {
-          if (timing.localTime <= 0) {
-            seekAudioElement(track, audio, 0);
+          if (timing.sourceTime <= timing.trimIn) {
+            seekAudioElement(track, audio, timing.trimIn);
           } else {
-            seekAudioElement(track, audio, Math.max(timing.duration - 0.001, 0));
+            seekAudioElement(track, audio, Math.max(timing.trimOut - 0.001, timing.trimIn));
           }
           audio.pause();
         } else {
-          const safeLocalTime = clamp(timing.localTime, 0, Math.max(timing.duration - 0.001, 0));
-          const drift = Math.abs(audio.currentTime - safeLocalTime);
+          const safeSourceTime = clamp(
+            timing.sourceTime,
+            timing.trimIn,
+            Math.max(timing.trimOut - 0.001, timing.trimIn)
+          );
+          const drift = Math.abs(audio.currentTime - safeSourceTime);
           if (Number.isFinite(drift) && drift > 0.25) {
-            seekAudioElement(track, audio, safeLocalTime);
+            seekAudioElement(track, audio, safeSourceTime);
           }
           if (audio.paused) {
             const result = audio.play();
@@ -4179,7 +4370,9 @@ export default function App() {
     };
 
     const ccRuntime = midiTrackRuntimeRef.current;
+    const pcRuntime = midiPcRuntimeRef.current;
     const noteRuntime = midiNoteRuntimeRef.current;
+    const epsilon = 0.5 / fps;
     const sendNoteOff = (state) => {
       const channel = Math.max(0, Math.min(15, Math.round(Number(state?.channel) || 0)));
       const noteNumber = Math.max(0, Math.min(127, Math.round(Number(state?.note) || 0)));
@@ -4190,7 +4383,47 @@ export default function App() {
     };
 
     const sendTick = () => {
-      const currentTime = playheadRef.current;
+      const projectLength = Math.max(Number(project.view.length) || 0, 0);
+      const currentTime = clamp(Number(playheadRef.current) || 0, 0, projectLength);
+      const rawPrevPcTime = Number(midiPcPlaybackRef.current.lastTime);
+      const hasPrevPcTime = Number.isFinite(rawPrevPcTime);
+      const prevPcTime = hasPrevPcTime ? clamp(rawPrevPcTime, 0, projectLength) : currentTime;
+      const maxContinuousStep = Math.max((tickMs / 1000) * 4, 0.12);
+      const loopEnabled = Boolean(project.view.loopEnabled);
+      const loopStart = clamp(Number(project.view.loopStart) || 0, 0, projectLength);
+      const loopEnd = clamp(Number(project.view.loopEnd) || projectLength, 0, projectLength);
+
+      const triggerRanges = [];
+      const pushTriggerRange = (start, end, includeStart) => {
+        const safeStart = clamp(Math.min(start, end), 0, projectLength);
+        const safeEnd = clamp(Math.max(start, end), 0, projectLength);
+        triggerRanges.push({ start: safeStart, end: safeEnd, includeStart: Boolean(includeStart) });
+      };
+      if (!hasPrevPcTime) {
+        pcRuntime.clear();
+        pushTriggerRange(currentTime, currentTime, true);
+      } else if (currentTime >= prevPcTime) {
+        if (currentTime - prevPcTime > maxContinuousStep) {
+          pcRuntime.clear();
+          pushTriggerRange(currentTime, currentTime, true);
+        } else {
+          pushTriggerRange(prevPcTime, currentTime, false);
+        }
+      } else if (loopEnabled && loopEnd - loopStart > epsilon) {
+        pcRuntime.clear();
+        pushTriggerRange(prevPcTime, loopEnd, false);
+        pushTriggerRange(loopStart, currentTime, true);
+      } else {
+        pcRuntime.clear();
+        pushTriggerRange(currentTime, currentTime, true);
+      }
+      const isProgramTriggeredAt = (nodeTime) => triggerRanges.some((range) => {
+        if (range.includeStart) {
+          return nodeTime >= range.start - epsilon && nodeTime <= range.end + epsilon;
+        }
+        return nodeTime > range.start + epsilon && nodeTime <= range.end + epsilon;
+      });
+
       const activeCcTrackIds = new Set();
       project.tracks.forEach((track) => {
         if (track.kind !== 'midi') return;
@@ -4212,6 +4445,46 @@ export default function App() {
         if (activeCcTrackIds.has(trackId)) return;
         ccRuntime.delete(trackId);
       });
+
+      const activePcNodeKeys = new Set();
+      project.tracks.forEach((track) => {
+        if (track.kind !== 'midi-pc') return;
+        if (track.mute) return;
+        if (!isTrackEnabled(track, 'midi-pc')) return;
+        const outputId = getMidiTrackOutputId(track);
+        const channel = Math.max(1, Math.min(16, Math.round(Number(track.midi?.channel) || 1))) - 1;
+        const fallbackProgram = toMidiCcValue(track.midi?.program, track.default ?? 0);
+        const nodes = Array.isArray(track.nodes) ? track.nodes : [];
+        nodes.forEach((node) => {
+          const triggerTime = Number(node?.t);
+          if (!Number.isFinite(triggerTime)) return;
+          if (!isProgramTriggeredAt(triggerTime)) return;
+          const nodeKey = `${track.id}:${node.id}`;
+          activePcNodeKeys.add(nodeKey);
+          const program = toMidiCcValue(node?.v, fallbackProgram);
+          const state = pcRuntime.get(nodeKey);
+          if (state
+            && Math.abs((Number(state.triggerTime) || 0) - triggerTime) <= epsilon
+            && state.program === program
+            && state.channel === channel
+            && state.outputId === outputId) {
+            return;
+          }
+          const sent = sendMidiBytes(outputId, [0xc0 | channel, program]);
+          if (!sent) return;
+          pcRuntime.set(nodeKey, {
+            triggerTime,
+            outputId,
+            channel,
+            program,
+          });
+        });
+      });
+      pcRuntime.forEach((_state, nodeKey) => {
+        if (activePcNodeKeys.has(nodeKey)) return;
+        pcRuntime.delete(nodeKey);
+      });
+      midiPcPlaybackRef.current.lastTime = currentTime;
 
       const activeNoteKeys = new Set();
       project.tracks.forEach((track) => {
@@ -4254,7 +4527,16 @@ export default function App() {
     return () => {
       window.clearInterval(intervalId);
     };
-  }, [isPlaying, project.midi?.outputId, project.timebase.fps, project.tracks]);
+  }, [
+    isPlaying,
+    project.midi?.outputId,
+    project.timebase.fps,
+    project.tracks,
+    project.view.length,
+    project.view.loopEnabled,
+    project.view.loopStart,
+    project.view.loopEnd,
+  ]);
 
   useEffect(() => {
     if (isPlaying) return;
@@ -4281,6 +4563,8 @@ export default function App() {
       noteRuntime.clear();
     }
     midiTrackRuntimeRef.current.clear();
+    midiPcRuntimeRef.current.clear();
+    midiPcPlaybackRef.current.lastTime = clamp(Number(playheadRef.current) || 0, 0, project.view.length);
   }, [isPlaying, project.tracks, project.midi?.outputId]);
 
   useEffect(() => {
@@ -4313,13 +4597,29 @@ export default function App() {
     }
 
     const ccRuntime = midiTrackRuntimeRef.current;
-    if (!ccRuntime.size) return;
-    const activeCcTrackIds = new Set(
-      project.tracks.filter((track) => track.kind === 'midi').map((track) => track.id)
-    );
-    ccRuntime.forEach((_state, trackId) => {
-      if (activeCcTrackIds.has(trackId)) return;
-      ccRuntime.delete(trackId);
+    if (ccRuntime.size) {
+      const activeCcTrackIds = new Set(
+        project.tracks.filter((track) => track.kind === 'midi').map((track) => track.id)
+      );
+      ccRuntime.forEach((_state, trackId) => {
+        if (activeCcTrackIds.has(trackId)) return;
+        ccRuntime.delete(trackId);
+      });
+    }
+
+    const pcRuntime = midiPcRuntimeRef.current;
+    if (!pcRuntime.size) return;
+    const activePcNodeKeys = new Set();
+    project.tracks.forEach((track) => {
+      if (track.kind !== 'midi-pc') return;
+      const nodes = Array.isArray(track.nodes) ? track.nodes : [];
+      nodes.forEach((node) => {
+        activePcNodeKeys.add(`${track.id}:${node.id}`);
+      });
+    });
+    pcRuntime.forEach((_state, nodeKey) => {
+      if (activePcNodeKeys.has(nodeKey)) return;
+      pcRuntime.delete(nodeKey);
     });
   }, [project.tracks, project.midi?.outputId]);
 
@@ -4649,6 +4949,13 @@ export default function App() {
         if (event.key === 'Escape') {
           event.preventDefault();
           setEditingAudioClip(null);
+        }
+        return;
+      }
+      if (editingAudioFade) {
+        if (event.key === 'Escape') {
+          event.preventDefault();
+          setEditingAudioFade(null);
         }
         return;
       }
@@ -4992,6 +5299,85 @@ export default function App() {
         handlePlayToggle();
         return;
       }
+      if (selectedTrack && selectedTrack.kind === 'audio' && selectedTrack.audio?.src) {
+        const timing = getAudioTrackTiming(selectedTrack, null, playhead);
+        if (timing.inRange) {
+          if (key === 'd') {
+            event.preventDefault();
+            const playheadFadeIn = clamp(timing.localTime, 0, Math.max(timing.clipDuration, 0));
+            handlePatchAudioClip(selectedTrack.id, {
+              fadeInEnabled: true,
+              fadeInDuration: playheadFadeIn,
+            });
+            return;
+          }
+          if (key === 'g') {
+            event.preventDefault();
+            const playheadFadeOut = clamp(
+              timing.clipDuration - timing.localTime,
+              0,
+              Math.max(timing.clipDuration, 0)
+            );
+            handlePatchAudioClip(selectedTrack.id, {
+              fadeOutEnabled: true,
+              fadeOutDuration: playheadFadeOut,
+            });
+            return;
+          }
+          if (key === 'a') {
+            event.preventDefault();
+            const minSpan = Math.min(0.01, Math.max(timing.duration, 0.01));
+            const nextTrimIn = clamp(timing.sourceTime, 0, Math.max(timing.trimOut - minSpan, 0));
+            const movedBy = nextTrimIn - timing.trimIn;
+            const nextClipStart = clamp(timing.clipStart + movedBy, 0, project.view.length);
+            const previousClipEnd = timing.clipStart + timing.clipDuration;
+            const nextClipDuration = Math.max(timing.trimOut - nextTrimIn, 0);
+            const nextClipEnd = nextClipStart + nextClipDuration;
+            const currentFadeInDuration = clamp(Number(selectedTrack.audio?.fadeInDuration) || 0, 0, timing.clipDuration);
+            const currentFadeOutDuration = clamp(Number(selectedTrack.audio?.fadeOutDuration) || 0, 0, timing.clipDuration);
+            const fadeInPeakTime = timing.clipStart + currentFadeInDuration;
+            const fadeOutStartTime = previousClipEnd - currentFadeOutDuration;
+            const patch = {
+              clipStart: nextClipStart,
+              trimIn: nextTrimIn,
+            };
+            if (selectedTrack.audio?.fadeInEnabled) {
+              patch.fadeInDuration = clamp(fadeInPeakTime - nextClipStart, 0, nextClipDuration);
+            }
+            if (selectedTrack.audio?.fadeOutEnabled) {
+              patch.fadeOutDuration = clamp(nextClipEnd - fadeOutStartTime, 0, nextClipDuration);
+            }
+            handlePatchAudioClip(selectedTrack.id, patch);
+            return;
+          }
+          if (key === 's') {
+            event.preventDefault();
+            const minSpan = Math.min(0.01, Math.max(timing.duration, 0.01));
+            const nextTrimOut = clamp(
+              timing.sourceTime,
+              Math.min(timing.trimIn + minSpan, timing.duration),
+              timing.duration
+            );
+            const currentFadeOutDuration = clamp(
+              Number(selectedTrack.audio?.fadeOutDuration) || 0,
+              0,
+              timing.clipDuration
+            );
+            const previousClipEnd = timing.clipStart + timing.clipDuration;
+            const fadeOutStartTime = previousClipEnd - currentFadeOutDuration;
+            const nextClipDuration = Math.max(nextTrimOut - timing.trimIn, 0);
+            const nextClipEnd = timing.clipStart + nextClipDuration;
+            const patch = {
+              trimOut: nextTrimOut,
+            };
+            if (selectedTrack.audio?.fadeOutEnabled) {
+              patch.fadeOutDuration = clamp(nextClipEnd - fadeOutStartTime, 0, nextClipDuration);
+            }
+            handlePatchAudioClip(selectedTrack.id, patch);
+            return;
+          }
+        }
+      }
       if (event.key === 'Backspace' || event.key === 'Delete') {
         event.preventDefault();
         const selectedNodeEntries = Array.from(selectedNodeIdsByTrackRef.current.entries())
@@ -5085,9 +5471,11 @@ export default function App() {
     multiAddDialog,
     audioChannelMapTrackId,
     editingAudioClip,
+    editingAudioFade,
     isPlaying,
     playhead,
     selectedTrackId,
+    selectedTrack,
     selectedTrackIds,
     selectedNodeContext,
     handlePlayToggle,
@@ -5108,7 +5496,9 @@ export default function App() {
 
   useEffect(() => {
     if (isPlaying) return;
-    oscFlagPlaybackRef.current.lastTime = clamp(Number(playheadRef.current) || 0, 0, project.view.length);
+    const safeTime = clamp(Number(playheadRef.current) || 0, 0, project.view.length);
+    oscFlagPlaybackRef.current.lastTime = safeTime;
+    midiPcPlaybackRef.current.lastTime = safeTime;
   }, [isPlaying, project.view.length, playhead]);
 
   useEffect(() => {
@@ -5626,6 +6016,11 @@ export default function App() {
       const cc = Math.max(0, Math.min(127, Math.round(Number(track.midi?.controlNumber) || 1)));
       return `MIDI CC Ch ${channel} · CC ${cc}`;
     }
+    if (track.kind === 'midi-pc') {
+      const channel = Math.max(1, Math.min(16, Math.round(Number(track.midi?.channel) || 1)));
+      const program = Math.max(0, Math.min(127, Math.round(Number(track.midi?.program) || 0)));
+      return `MIDI PC Ch ${channel} · PC ${program}`;
+    }
     if (track.kind === 'midi-note') {
       const channel = Math.max(1, Math.min(16, Math.round(Number(track.midi?.channel) || 1)));
       return `MIDI Note Ch ${channel}`;
@@ -5694,6 +6089,22 @@ export default function App() {
           ...node,
           t: safeTime,
           v: toMidiCcValue(node?.v, sampled),
+          curve: 'linear',
+        },
+      });
+      return;
+    }
+    if (track?.kind === 'midi-pc') {
+      const safeTime = clamp(Number(node?.t) || playhead, 0, project.view.length);
+      const sampled = sampleTrackValue(track, safeTime);
+      dispatch({
+        type: 'add-node',
+        id: trackId,
+        node: {
+          ...node,
+          t: safeTime,
+          v: toMidiCcValue(node?.v, sampled),
+          y: Number.isFinite(Number(node?.y)) ? clamp(Number(node.y), 0, 1) : 0.5,
           curve: 'linear',
         },
       });
@@ -5784,7 +6195,8 @@ export default function App() {
     const track = project.tracks.find((item) => item.id === trackId);
     if (track?.kind === 'audio') return;
     const nextPatch = { ...patch };
-    if (track?.kind === 'midi' && Object.prototype.hasOwnProperty.call(nextPatch, 'v')) {
+    if ((track?.kind === 'midi' || track?.kind === 'midi-pc')
+      && Object.prototype.hasOwnProperty.call(nextPatch, 'v')) {
       nextPatch.v = toMidiCcValue(nextPatch.v, track.default);
     }
     if ((track?.kind === 'dmx' || track?.kind === 'dmx-color')
@@ -5875,8 +6287,12 @@ export default function App() {
     if (Object.prototype.hasOwnProperty.call(nextPatch, 'y')) {
       nextPatch.y = Number.isFinite(Number(nextPatch.y)) ? clamp(Number(nextPatch.y), 0, 1) : 0.5;
     }
-    if (track.kind === 'midi' && Object.prototype.hasOwnProperty.call(nextPatch, 'v')) {
+    if ((track.kind === 'midi' || track.kind === 'midi-pc')
+      && Object.prototype.hasOwnProperty.call(nextPatch, 'v')) {
       nextPatch.v = toMidiCcValue(nextPatch.v, track.default);
+    }
+    if (track.kind === 'midi-pc' && Object.prototype.hasOwnProperty.call(nextPatch, 'y')) {
+      nextPatch.y = Number.isFinite(Number(nextPatch.y)) ? clamp(Number(nextPatch.y), 0, 1) : 0.5;
     }
     if ((track.kind === 'dmx' || track.kind === 'dmx-color')
       && Object.prototype.hasOwnProperty.call(nextPatch, 'v')) {
@@ -5908,6 +6324,10 @@ export default function App() {
     const target = event.target;
     if (target?.closest?.('[data-selectable-node="1"]')) return;
     if (target?.closest?.('.audio-lane__clip-hit')) return;
+    if (target?.closest?.('.audio-lane__trim-handle')) return;
+    if (target?.closest?.('.audio-lane__fade')) return;
+    if (target?.closest?.('.audio-lane__fade-handle')) return;
+    if (target?.closest?.('.audio-lane__fade-curve-handle')) return;
 
     const panel = trackLanesPanelRef.current;
     if (!panel) return;
@@ -6144,7 +6564,7 @@ export default function App() {
       valueMinutes: String(parts.minutes),
       valueSeconds: String(parts.seconds),
       valueFrames: String(parts.frames),
-      value: track?.kind === 'midi'
+      value: track?.kind === 'midi' || track?.kind === 'midi-pc'
         ? String(toMidiCcValue(numeric, track.default ?? 0))
         : track?.kind === 'dmx' || track?.kind === 'dmx-color'
           ? String(toDmxValue(numeric, track.default ?? 0))
@@ -6260,9 +6680,27 @@ export default function App() {
       stopInternalClock();
       return;
     }
+    let startTime = clamp(Number(playheadRef.current) || Number(playhead) || 0, 0, project.view.length);
+    if (project.view.loopEnabled) {
+      const loopStart = clamp(Number(project.view.loopStart) || 0, 0, project.view.length);
+      startTime = loopStart;
+    }
+    if (Math.abs(startTime - playheadRef.current) > 1e-6) {
+      const span = Math.max(project.view.end - project.view.start, 0.001);
+      if (startTime < project.view.start || startTime > project.view.end) {
+        const targetStart = clamp(
+          startTime - span * 0.25,
+          0,
+          Math.max(project.view.length - span, 0)
+        );
+        dispatch({ type: 'scroll-time', start: targetStart });
+      }
+      setPlayhead(startTime);
+      syncAudioToPlayhead(startTime);
+    }
     if (useNativeAudioEngine) {
       await configureNativeAudioEngine().catch(() => {});
-      playNativeAudioEngine(playhead);
+      playNativeAudioEngine(startTime);
     }
     resumeAudioEngines();
     project.tracks.forEach((track) => {
@@ -6277,24 +6715,24 @@ export default function App() {
           routing.context.resume().catch(() => {});
         }
       }
-      const timing = getAudioTrackTiming(track, audio, playhead);
+      const timing = getAudioTrackTiming(track, audio, startTime);
       if (!timing.inRange) {
-        if (timing.localTime < 0) {
-          seekAudioElement(track, audio, 0);
+        if (timing.sourceTime < timing.trimIn) {
+          seekAudioElement(track, audio, timing.trimIn);
         } else {
-          seekAudioElement(track, audio, Math.max(timing.duration - 0.001, 0));
+          seekAudioElement(track, audio, Math.max(timing.trimOut - 0.001, timing.trimIn));
         }
         audio.pause();
         return;
       }
-      seekAudioElement(track, audio, timing.localTime);
+      seekAudioElement(track, audio, timing.sourceTime);
       const result = audio.play();
       if (result && typeof result.catch === 'function') {
         result.catch(() => {});
       }
     });
     if (project.timebase?.sync === 'Internal') {
-      startInternalClock(playhead);
+      startInternalClock(startTime);
     }
     setIsPlaying(true);
   }
@@ -6461,6 +6899,17 @@ export default function App() {
     });
   };
 
+  const handlePatchAudioClip = (trackId, audioPatch) => {
+    if (!trackId || !audioPatch || typeof audioPatch !== 'object') return;
+    dispatch({
+      type: 'update-track',
+      id: trackId,
+      patch: {
+        audio: audioPatch,
+      },
+    });
+  };
+
   const handleEditAudioClipStart = (trackId, clipStart) => {
     const safeStart = clamp(Number(clipStart) || 0, 0, project.view.length);
     const parts = secondsToHmsfParts(safeStart, syncFpsPreset.fps);
@@ -6470,6 +6919,37 @@ export default function App() {
       minutes: String(parts.minutes),
       seconds: String(parts.seconds),
       frames: String(parts.frames),
+    });
+  };
+
+  const handleEditAudioFade = (trackId, mode) => {
+    const track = project.tracks.find((item) => item.id === trackId && item.kind === 'audio');
+    if (!track) return;
+    const fadeMode = mode === 'out' ? 'out' : 'in';
+    const duration = Math.max(Number(track.audio?.duration) || 0, 0);
+    const trim = resolveAudioTrimRange(duration, track.audio?.trimIn, track.audio?.trimOut);
+    const currentDuration = fadeMode === 'in'
+      ? Math.min(Math.max(Number(track.audio?.fadeInDuration) || 0, 0), trim.clipDuration)
+      : Math.min(Math.max(Number(track.audio?.fadeOutDuration) || 0, 0), trim.clipDuration);
+    const enabled = fadeMode === 'in'
+      ? Boolean(track.audio?.fadeInEnabled)
+      : Boolean(track.audio?.fadeOutEnabled);
+    const shape = normalizeAudioFadeShape(
+      fadeMode === 'in' ? track.audio?.fadeInShape : track.audio?.fadeOutShape
+    );
+    const curvature = clamp(
+      Number(fadeMode === 'in' ? track.audio?.fadeInCurvature : track.audio?.fadeOutCurvature) || 0,
+      -1,
+      1
+    );
+    setEditingAudioFade({
+      trackId,
+      mode: fadeMode,
+      enabled,
+      duration: currentDuration > 0 ? String(currentDuration.toFixed(2)) : '',
+      shape,
+      curvature: String(curvature.toFixed(2)),
+      clipDuration: trim.clipDuration,
     });
   };
 
@@ -6679,7 +7159,7 @@ export default function App() {
         0,
         project.view.length
       );
-      const rounded = track?.kind === 'midi'
+      const rounded = track?.kind === 'midi' || track?.kind === 'midi-pc'
         ? toMidiCcValue(value, track.default ?? 0)
         : track?.kind === 'dmx' || track?.kind === 'dmx-color'
           ? toDmxValue(value, track.default ?? 0)
@@ -6720,6 +7200,32 @@ export default function App() {
     );
     handleAudioClipMove(editingAudioClip.trackId, time);
     setEditingAudioClip(null);
+  };
+
+  const handleSaveAudioFade = () => {
+    if (!editingAudioFade) return;
+    const duration = Math.max(Number(editingAudioFade.duration) || 0, 0);
+    const clipDuration = Math.max(Number(editingAudioFade.clipDuration) || 0, 0);
+    const limitedDuration = clamp(duration, 0, clipDuration);
+    const shape = normalizeAudioFadeShape(editingAudioFade.shape);
+    const curvature = clamp(Number(editingAudioFade.curvature) || 0, -1, 1);
+    const enabled = Boolean(editingAudioFade.enabled) && limitedDuration > 0;
+    if (editingAudioFade.mode === 'in') {
+      handlePatchAudioClip(editingAudioFade.trackId, {
+        fadeInEnabled: enabled,
+        fadeInDuration: limitedDuration,
+        fadeInShape: shape,
+        fadeInCurvature: curvature,
+      });
+    } else {
+      handlePatchAudioClip(editingAudioFade.trackId, {
+        fadeOutEnabled: enabled,
+        fadeOutDuration: limitedDuration,
+        fadeOutShape: shape,
+        fadeOutCurvature: curvature,
+      });
+    }
+    setEditingAudioFade(null);
   };
 
   const getOsc3dEditingState = (draft) => {
@@ -6943,6 +7449,7 @@ export default function App() {
         || editingCue
         || editingLoopRange
         || editingAudioClip
+        || editingAudioFade
         || audioChannelMapTrackId
       ) return;
 
@@ -6970,6 +7477,7 @@ export default function App() {
     editingCue,
     editingLoopRange,
     editingAudioClip,
+    editingAudioFade,
     audioChannelMapTrackId,
     playhead,
   ]);
@@ -7279,6 +7787,7 @@ export default function App() {
     setIsAddTrackMenuOpen(false);
     const safeKind = kind === 'audio'
       || kind === 'midi'
+      || kind === 'midi-pc'
       || kind === 'midi-note'
       || kind === 'group'
       || kind === 'dmx'
@@ -7321,6 +7830,7 @@ export default function App() {
     const safeKind =
       multiAddDialog.kind === 'audio'
       || multiAddDialog.kind === 'midi'
+      || multiAddDialog.kind === 'midi-pc'
       || multiAddDialog.kind === 'midi-note'
       || multiAddDialog.kind === 'group'
       || multiAddDialog.kind === 'dmx'
@@ -7434,6 +7944,27 @@ export default function App() {
       return;
     }
 
+    if (safeKind === 'midi-pc') {
+      const outputId =
+        typeof multiAddDialog.midiOutputId === 'string' && multiAddDialog.midiOutputId
+          ? multiAddDialog.midiOutputId
+          : (project.midi?.outputId || VIRTUAL_MIDI_OUTPUT_ID);
+      const channel = clamp(Math.round(Number(multiAddDialog.midiChannel) || 1), 1, 16);
+      const startProgram = clamp(Math.round(Number(multiAddDialog.midiStart) || 0), 0, 127);
+      const items = Array.from({ length: count }, (_, index) => {
+        const program = clamp(startProgram + index, 0, 127);
+        return {
+          kind: 'midi-pc',
+          options: {
+            midi: { outputId, channel, program },
+          },
+        };
+      });
+      dispatch({ type: 'add-tracks', items });
+      setMultiAddDialog(null);
+      return;
+    }
+
     if (safeKind === 'midi-note') {
       const outputId =
         typeof multiAddDialog.midiOutputId === 'string' && multiAddDialog.midiOutputId
@@ -7530,6 +8061,10 @@ export default function App() {
                 <div className="help-shortcuts__row"><kbd>.</kbd><span>Jump to next cue</span></div>
                 <div className="help-shortcuts__row"><kbd>=</kbd><span>Add cue at playhead</span></div>
                 <div className="help-shortcuts__row"><kbd>-</kbd><span>Delete nearest cue at playhead</span></div>
+                <div className="help-shortcuts__row"><kbd>D</kbd><span>Audio track only: set Fade In duration from clip head to playhead</span></div>
+                <div className="help-shortcuts__row"><kbd>G</kbd><span>Audio track only: set Fade Out duration from playhead to clip tail</span></div>
+                <div className="help-shortcuts__row"><kbd>A</kbd><span>Audio track only: trim clip head to playhead (non-destructive)</span></div>
+                <div className="help-shortcuts__row"><kbd>S</kbd><span>Audio track only: trim clip tail to playhead (non-destructive)</span></div>
                 <div className="help-shortcuts__row"><kbd>Backspace / Delete</kbd><span>Delete selected node(s), or selected track(s)</span></div>
                 <div className="help-shortcuts__row"><kbd>Cmd/Ctrl + O</kbd><span>Add OSC track</span></div>
                 <div className="help-shortcuts__row"><kbd>Cmd/Ctrl + A</kbd><span>Add Audio track</span></div>
@@ -7574,6 +8109,11 @@ export default function App() {
                 <div className="help-shortcuts__row"><kbd>Drag Audio Clip</kbd><span>Move clip start time on timeline</span></div>
                 <div className="help-shortcuts__row"><kbd>Alt/Option + Drag Audio Clip</kbd><span>Snap clip start to nearest cue</span></div>
                 <div className="help-shortcuts__row"><kbd>Double Click Audio Clip</kbd><span>Edit clip start time</span></div>
+                <div className="help-shortcuts__row"><kbd>Drag Audio Clip Edge</kbd><span>Trim clip head/tail, and drag back to restore trimmed content</span></div>
+                <div className="help-shortcuts__row"><kbd>Alt/Option + Drag Audio Clip Edge</kbd><span>Snap trim edge to nearest cue</span></div>
+                <div className="help-shortcuts__row"><kbd>Drag Fade Handle</kbd><span>Adjust Fade In/Out duration</span></div>
+                <div className="help-shortcuts__row"><kbd>Drag Fade Curve Dot</kbd><span>Adjust fade curve curvature</span></div>
+                <div className="help-shortcuts__row"><kbd>Double Click Fade Area</kbd><span>Edit fade mode/duration/curve in dialog</span></div>
                 <div className="help-shortcuts__row"><kbd>Drag ◣ / ◢</kbd><span>Set loop start / end range</span></div>
                 <div className="help-shortcuts__row"><kbd>Double Click ◣ / ◢</kbd><span>Edit loop range with exact hh:mm:ss.ff</span></div>
                 <div className="help-shortcuts__row"><kbd>Right Click Node</kbd><span>Change node curve mode</span></div>
@@ -8081,6 +8621,8 @@ export default function App() {
                   ? 'Add Multi Audio'
                     : multiAddDialog.kind === 'midi'
                       ? 'Add Multi MIDI CC'
+                    : multiAddDialog.kind === 'midi-pc'
+                      ? 'Add Multi MIDI PC'
                     : multiAddDialog.kind === 'group'
                       ? 'Add Multi Group'
                     : multiAddDialog.kind === 'midi-note'
@@ -8266,7 +8808,7 @@ export default function App() {
                   />
                 </div>
               )}
-              {(multiAddDialog.kind === 'midi' || multiAddDialog.kind === 'midi-note') && (
+              {(multiAddDialog.kind === 'midi' || multiAddDialog.kind === 'midi-pc' || multiAddDialog.kind === 'midi-note') && (
                 <>
                   <div className="field">
                     <label>MIDI Out Port</label>
@@ -8311,7 +8853,11 @@ export default function App() {
                     </div>
                   </div>
                   <div className="field">
-                    <label>{multiAddDialog.kind === 'midi-note' ? 'Start Note' : 'Start CC'}</label>
+                    <label>
+                      {multiAddDialog.kind === 'midi-note'
+                        ? 'Start Note'
+                        : (multiAddDialog.kind === 'midi-pc' ? 'Start Program' : 'Start CC')}
+                    </label>
                     <NumberInput
                       className="input"
                      
@@ -8330,7 +8876,9 @@ export default function App() {
                   <div className="field__hint">
                     {multiAddDialog.kind === 'midi-note'
                       ? 'MIDI note numbers will auto-increment by track.'
-                      : 'MIDI CC numbers will auto-increment by track.'}
+                      : multiAddDialog.kind === 'midi-pc'
+                        ? 'MIDI Program Change values will auto-increment by track.'
+                        : 'MIDI CC numbers will auto-increment by track.'}
                   </div>
                 </>
               )}
@@ -9036,6 +9584,7 @@ export default function App() {
                       className="input"
                       step={
                         editingNodeTrack?.kind === 'midi'
+                        || editingNodeTrack?.kind === 'midi-pc'
                         || editingNodeTrack?.kind === 'dmx'
                         || editingNodeTrack?.kind === 'dmx-color'
                         || (editingNodeTrack?.kind === 'osc' && editingNode.valueType === 'int')
@@ -9047,7 +9596,7 @@ export default function App() {
                         setEditingNode((prev) => {
                           if (!prev) return prev;
                           const raw = event.target.value;
-                          if (editingNodeTrack?.kind === 'midi') {
+                          if (editingNodeTrack?.kind === 'midi' || editingNodeTrack?.kind === 'midi-pc') {
                             const numeric = Number(raw);
                             return { ...prev, value: Number.isFinite(numeric) ? String(Math.round(numeric)) : raw };
                           }
@@ -9361,6 +9910,83 @@ export default function App() {
         </div>
       )}
 
+      {editingAudioFade && (
+        <div className="modal" role="dialog" aria-modal="true">
+          <div className="modal__card">
+            <div className="modal__header">
+              <div className="label">
+                {editingAudioFade.mode === 'in' ? 'Edit Fade In' : 'Edit Fade Out'}
+              </div>
+            </div>
+            <div className="modal__content">
+              <div className="field">
+                <label>Enable</label>
+                <button
+                  className={`btn btn--ghost ${editingAudioFade.enabled ? 'is-active' : ''}`}
+                  onClick={() =>
+                    setEditingAudioFade((prev) => (prev ? { ...prev, enabled: !prev.enabled } : prev))}
+                >
+                  {editingAudioFade.enabled ? 'On' : 'Off'}
+                </button>
+              </div>
+              <div className="field">
+                <label>Duration (sec)</label>
+                <NumberInput
+                  className="input"
+                  min="0"
+                  step="0.01"
+                  value={editingAudioFade.duration}
+                  onChange={(event) =>
+                    setEditingAudioFade((prev) => (prev ? { ...prev, duration: event.target.value } : prev))}
+                />
+              </div>
+              <div className="field">
+                <label>Curve</label>
+                <select
+                  className="input"
+                  value={editingAudioFade.shape}
+                  onChange={(event) =>
+                    setEditingAudioFade((prev) => (prev ? { ...prev, shape: event.target.value } : prev))}
+                >
+                  {AUDIO_FADE_SHAPE_OPTIONS.map((option) => (
+                    <option key={option.id} value={option.id}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="field">
+                <label>Curve Amount (-1 to 1)</label>
+                <div className="field-grid">
+                  <input
+                    type="range"
+                    min="-1"
+                    max="1"
+                    step="0.01"
+                    value={Number(editingAudioFade.curvature) || 0}
+                    onChange={(event) =>
+                      setEditingAudioFade((prev) => (prev ? { ...prev, curvature: event.target.value } : prev))}
+                  />
+                  <NumberInput
+                    className="input"
+                    min="-1"
+                    max="1"
+                    step="0.01"
+                    value={editingAudioFade.curvature}
+                    onChange={(event) =>
+                      setEditingAudioFade((prev) => (prev ? { ...prev, curvature: event.target.value } : prev))}
+                  />
+                </div>
+              </div>
+              <div className="modal__actions">
+                <button className="btn btn--ghost" onClick={() => setEditingAudioFade(null)}>Cancel</button>
+                <button className="btn" onClick={handleSaveAudioFade}>Save</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       <input
         ref={fileInputRef}
         type="file"
@@ -9650,6 +10276,19 @@ export default function App() {
                             }}
                           >
                             {addTrackMenuMode === 'multi' ? 'Add Multi MIDI CC' : 'Add MIDI CC'}
+                          </button>
+                          <button
+                            className="tracks-add-menu__item"
+                            onClick={() => {
+                              if (addTrackMenuMode === 'multi') {
+                                openMultiAddDialog('midi-pc');
+                                return;
+                              }
+                              dispatch({ type: 'add-track', kind: 'midi-pc' });
+                              setIsAddTrackMenuOpen(false);
+                            }}
+                          >
+                            {addTrackMenuMode === 'multi' ? 'Add Multi MIDI PC' : 'Add MIDI PC'}
                           </button>
                           <button
                             className="tracks-add-menu__item"
@@ -10110,6 +10749,28 @@ export default function App() {
                               </>
                             )
                           )}
+                          {renderDetailedMeta && track.kind === 'midi-pc' && (
+                            effectiveTrackInfoDensity === 'full' ? (
+                              <>
+                                <span>MIDI PC Track</span>
+                                <span>
+                                  Ch {Math.max(1, Math.min(16, Math.round(Number(track.midi?.channel) || 1)))}
+                                  {' · '}
+                                  PC {Math.max(0, Math.min(127, Math.round(Number(track.midi?.program) || 0)))}
+                                </span>
+                                <span className="track-row__osc">
+                                  {midiOutputNameMap.get(getMidiTrackOutputId(track)) || getMidiTrackOutputId(track)}
+                                </span>
+                              </>
+                            ) : (
+                              <>
+                                <span>MIDI PC Track</span>
+                                <span>
+                                  Ch {Math.max(1, Math.min(16, Math.round(Number(track.midi?.channel) || 1)))}
+                                </span>
+                              </>
+                            )
+                          )}
                           {renderDetailedMeta && track.kind === 'midi-note' && (
                             effectiveTrackInfoDensity === 'full' ? (
                               <>
@@ -10221,6 +10882,8 @@ export default function App() {
                                   ? 'Solo audio track'
                                   : track.kind === 'midi'
                                     ? 'Solo MIDI CC track output'
+                                    : track.kind === 'midi-pc'
+                                      ? 'Solo MIDI Program Change track output'
                                     : track.kind === 'midi-note'
                                       ? 'Solo MIDI Note track output'
                                     : track.kind === 'dmx'
@@ -10251,6 +10914,8 @@ export default function App() {
                                   ? 'Mute audio track'
                                   : track.kind === 'midi'
                                     ? 'Mute MIDI CC track output'
+                                    : track.kind === 'midi-pc'
+                                      ? 'Mute MIDI Program Change track output'
                                     : track.kind === 'midi-note'
                                       ? 'Mute MIDI Note track output'
                                     : track.kind === 'dmx'
@@ -10308,7 +10973,9 @@ export default function App() {
                         onDeleteNodes={handleDeleteNodes}
                         onSelectionChange={handleNodeSelectionChange}
                         onMoveAudioClip={handleAudioClipMove}
+                        onPatchAudioClip={handlePatchAudioClip}
                         onEditAudioClipStart={handleEditAudioClipStart}
+                        onEditAudioFade={handleEditAudioFade}
                         audioWaveform={audioWaveforms[track.id]}
                     />
                   );
@@ -10329,6 +10996,21 @@ export default function App() {
                   style={{ left: `${playheadX}px` }}
                 />
               </div>
+            </div>
+          </div>
+
+          <div className="timeline-scroll-dock">
+            <div className="timeline-scroll-dock__spacer" aria-hidden="true" />
+            <div className="timeline-scroll-dock__lane">
+              <input
+                className="timeline-scroll timeline-scroll--dock"
+                type="range"
+                min="0"
+                max={Math.max(project.view.length - (project.view.end - project.view.start), 0)}
+                step="0.01"
+                value={project.view.start}
+                onChange={(event) => handleScroll(Number(event.target.value))}
+              />
             </div>
           </div>
 
@@ -10412,6 +11094,11 @@ export default function App() {
               }
               if (selectedTrack.kind === 'midi-note') {
                 handleAddNode(selectedTrack.id, { t, v: 60, d: 0.5, curve: 'linear' });
+                return;
+              }
+              if (selectedTrack.kind === 'midi-pc') {
+                const v = toMidiCcValue(sampleTrackValue(selectedTrack, t), selectedTrack.default ?? 0);
+                handleAddNode(selectedTrack.id, { t, v, y: 0.5, curve: 'linear' });
                 return;
               }
               const v = sampleTrackValue(selectedTrack, t);

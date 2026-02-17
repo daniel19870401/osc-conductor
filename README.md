@@ -1,5 +1,7 @@
 # OSConductor
 
+[中文](README.md) | [English](README.en.md)
+
 <p align="left">
   <img src="docs/assets/osconductor-ui.png" alt="OSConductor UI" width="900" />
 </p>
@@ -21,14 +23,25 @@ OSC/Audio/MIDI/DMX 時間軸控制軟體。
 - 3D OSC 節點編輯（XY/YZ + 3D 視角），以及每軌獨立 3D Monitor 視窗
 - Node / Cue / Track 可複製、剪下、貼上，支援 Undo / Redo
 
-## 目前封裝版本（v1.2.2）
+## v1.2.3 新增功能
+
+- Audio Track 新增非破壞式 Trim：`A`（去頭到播放軸）、`S`（去尾到播放軸）
+- Audio Track Trim 後可用滑鼠拖拉音檔前/後端，恢復被修剪的頭尾
+- Audio Track 新增快捷：`D` 依播放軸位置建立 Fade In、`G` 依播放軸位置建立 Fade Out
+- Fade In / Fade Out 支援拖拉長度、拖拉曲率點、雙擊開啟編輯對話框（曲線/曲度/長度）
+- Fade 曲線 UI 與實際播放（Renderer / Native Audio Engine）已同步一致
+- Loop 播放行為更新：
+  - Loop 開啟時，從停止狀態按 Play 會先跳到 Loop 起點
+  - 播放中開啟 Loop 不會立即跳回，會在到達 Loop 尾端後回到起點
+
+## 目前封裝版本（v1.2.3）
 
 位於 `release/`：
 
-- `OSConductor-1.2.2-win-x64.exe`（Windows Intel x64）
-- `OSConductor-1.2.2-win-arm64.exe`（Windows ARM64）
-- `OSConductor-1.2.2-arm64.dmg`（macOS Apple Silicon，安裝檔）
-- `OSConductor-1.2.2-arm64-mac.zip`（macOS Apple Silicon，壓縮版）
+- `OSConductor-1.2.3-win-x64.exe`（Windows Intel x64）
+- `OSConductor-1.2.3-win-arm64.exe`（Windows ARM64）
+- `OSConductor-1.2.3-arm64.dmg`（macOS Apple Silicon，安裝檔）
+- `OSConductor-1.2.3-arm64-mac.zip`（macOS Apple Silicon，壓縮版）
 - `release/mac-arm64/OSConductor.app`（macOS Apple Silicon，app bundle）
 
 ## 開發
@@ -60,6 +73,10 @@ npx electron-builder --mac zip --arm64 --config.mac.identity=null --publish neve
 - `.`：跳下一個 Cue
 - `=`：在播放軸新增 Cue
 - `-`：刪除播放軸附近的 Cue
+- `D`：Audio 軌道且播放軸與 Clip 交錯時，設定 Fade In（從 Clip 頭到播放軸）
+- `G`：Audio 軌道且播放軸與 Clip 交錯時，設定 Fade Out（從播放軸到 Clip 尾）
+- `A`：Audio 軌道且播放軸與 Clip 交錯時，去掉播放軸前方頭段（非破壞式）
+- `S`：Audio 軌道且播放軸與 Clip 交錯時，去掉播放軸後方尾段（非破壞式）
 - `Backspace/Delete`：刪除選取 Node 或 Track
 - `Cmd/Ctrl + O`：新增 OSC Track
 - `Cmd/Ctrl + A`：新增 Audio Track
@@ -93,6 +110,11 @@ npx electron-builder --mac zip --arm64 --config.mac.identity=null --publish neve
 - `Alt/Option + 拖拉 Node`：吸附到最近 Cue
 - 右鍵 Node：切換曲線模式
 - 點擊色塊：套用 Track 顏色（可對多選軌道）
+- 拖拉 Audio Clip 前/後緣：Trim 音檔頭尾（可拖回復原）
+- `Alt/Option + 拖拉 Audio Clip 前/後緣`：Trim 邊緣吸附到最近 Cue
+- 拖拉 Fade 線：改 Fade In / Fade Out 長度
+- 拖拉 Fade 黃點：改 Fade 曲率（上下改曲度）
+- 雙擊 Fade 區域：開啟 Fade 編輯對話框
 - `Shift + 點 Track`：範圍選取
 - `Ctrl/Cmd + 點 Track`：間隔多選
 - `Shift + Alt/Option + 滾輪`：Zoom W

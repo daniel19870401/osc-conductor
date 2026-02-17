@@ -75,6 +75,12 @@ const DEFAULT_MIDI_NOTE_TRACK_SETTINGS = {
   note: 60,
   velocity: 100,
 };
+const DEFAULT_MIDI_PC_TRACK_SETTINGS = {
+  outputId: DEFAULT_MIDI_SETTINGS.outputId,
+  channel: 1,
+  mode: 'pc',
+  program: 0,
+};
 const DEFAULT_DMX_TRACK_SETTINGS = {
   host: '127.0.0.1',
   universe: 0,
@@ -86,7 +92,17 @@ const DEFAULT_AUDIO_TRACK_SETTINGS = {
   name: '',
   duration: 0,
   clipStart: 0,
+  trimIn: 0,
+  trimOut: 0,
   volume: 1,
+  fadeInEnabled: false,
+  fadeOutEnabled: false,
+  fadeInDuration: 0,
+  fadeOutDuration: 0,
+  fadeInShape: 'linear',
+  fadeOutShape: 'linear',
+  fadeInCurvature: 0,
+  fadeOutCurvature: 0,
   outputDeviceId: 'project-default',
   channels: 2,
   channelMapEnabled: false,
@@ -361,6 +377,38 @@ const normalizeAudioChannelMap = (value, channels) => {
   });
 };
 
+const normalizeAudioFadeShape = (value) => {
+  const next = typeof value === 'string' ? value.trim().toLowerCase() : 'linear';
+  if (
+    next === 'linear'
+    || next === 'ease-in'
+    || next === 'ease-out'
+    || next === 'ease-in-out'
+    || next === 's-curve'
+    || next === 'exp'
+    || next === 'log'
+  ) {
+    return next;
+  }
+  return 'linear';
+};
+
+const normalizeAudioTrimRange = (duration, trimInRaw, trimOutRaw) => {
+  const safeDuration = Math.max(toFinite(duration, 0), 0);
+  const minSpan = safeDuration > 0 ? Math.min(0.01, safeDuration) : 0;
+  const trimIn = clamp(toFinite(trimInRaw, 0), 0, safeDuration);
+  const parsedTrimOut = Number(trimOutRaw);
+  const fallbackTrimOut = safeDuration;
+  const rawTrimOut = Number.isFinite(parsedTrimOut) && parsedTrimOut > 0
+    ? parsedTrimOut
+    : (fallbackTrimOut > 0 ? fallbackTrimOut : 0);
+  let trimOut = clamp(rawTrimOut, 0, safeDuration);
+  if (safeDuration > 0 && trimOut <= trimIn) {
+    trimOut = clamp(trimIn + minSpan, 0, safeDuration);
+  }
+  return { trimIn, trimOut };
+};
+
 const normalizeMidiCcValue = (value, fallback = 0) => (
   clamp(Math.round(toFinite(value, fallback)), 0, 127)
 );
@@ -394,6 +442,8 @@ const normalizeTrack = (track, fallbackColor = '#5dd8c7') => {
   if (!next.kind) next.kind = 'osc';
   if (next.kind === 'midi' && track?.midi?.mode === 'note') {
     next.kind = 'midi-note';
+  } else if (next.kind === 'midi' && track?.midi?.mode === 'pc') {
+    next.kind = 'midi-pc';
   }
   if (!next.id) next.id = `track-${Date.now()}-${Math.random().toString(16).slice(2, 6)}`;
 
@@ -416,7 +466,7 @@ const normalizeTrack = (track, fallbackColor = '#5dd8c7') => {
     )
     : '';
 
-  if (next.kind === 'midi' || next.kind === 'midi-note') {
+  if (next.kind === 'midi' || next.kind === 'midi-note' || next.kind === 'midi-pc') {
     const midi = track.midi || {};
     if (next.kind === 'midi-note') {
       next.midi = {
@@ -432,6 +482,19 @@ const normalizeTrack = (track, fallbackColor = '#5dd8c7') => {
       next.min = 0;
       next.max = 127;
       next.default = clamp(Math.round(toFinite(next.default, 60)), 0, 127);
+    } else if (next.kind === 'midi-pc') {
+      next.midi = {
+        outputId:
+          typeof midi.outputId === 'string' && midi.outputId
+            ? midi.outputId
+            : DEFAULT_MIDI_PC_TRACK_SETTINGS.outputId,
+        channel: clamp(Math.round(toFinite(midi.channel, DEFAULT_MIDI_PC_TRACK_SETTINGS.channel)), 1, 16),
+        mode: 'pc',
+        program: clamp(Math.round(toFinite(midi.program, DEFAULT_MIDI_PC_TRACK_SETTINGS.program)), 0, 127),
+      };
+      next.min = 0;
+      next.max = 127;
+      next.default = normalizeMidiCcValue(next.default, next.midi.program);
     } else {
       next.midi = {
         outputId:
@@ -556,7 +619,7 @@ const normalizeTrack = (track, fallbackColor = '#5dd8c7') => {
     next.oscAddress = '';
   }
 
-  if (next.kind === 'midi') {
+  if (next.kind === 'midi' || next.kind === 'midi-pc') {
     next.default = normalizeMidiCcValue(next.default, 0);
   } else if (next.kind === 'midi-note') {
     next.default = clamp(Math.round(toFinite(next.default, 60)), 0, 127);
@@ -625,6 +688,10 @@ const normalizeTrack = (track, fallbackColor = '#5dd8c7') => {
         normalized.v = clamp(Math.round(toFinite(node?.v, next.default)), 0, 127);
         normalized.d = Math.max(toFinite(node?.d, 0.5), 0.01);
       }
+      if (next.kind === 'midi-pc') {
+        normalized.v = normalizeMidiCcValue(node?.v, next.default);
+        normalized.y = clamp(toFinite(node?.y, 0.5), 0, 1);
+      }
       if (next.kind === 'midi') {
         normalized.v = normalizeMidiCcValue(node?.v, next.default);
       }
@@ -646,6 +713,14 @@ const normalizeTrack = (track, fallbackColor = '#5dd8c7') => {
       duration: Math.max(toFinite(next.audio?.duration, 0), 0),
       clipStart: Math.max(toFinite(next.audio?.clipStart, 0), 0),
       volume: clamp(toFinite(next.audio?.volume, 1), 0, 1),
+      fadeInEnabled: Boolean(next.audio?.fadeInEnabled),
+      fadeOutEnabled: Boolean(next.audio?.fadeOutEnabled),
+      fadeInDuration: Math.max(toFinite(next.audio?.fadeInDuration, 0), 0),
+      fadeOutDuration: Math.max(toFinite(next.audio?.fadeOutDuration, 0), 0),
+      fadeInShape: normalizeAudioFadeShape(next.audio?.fadeInShape),
+      fadeOutShape: normalizeAudioFadeShape(next.audio?.fadeOutShape),
+      fadeInCurvature: clamp(toFinite(next.audio?.fadeInCurvature, 0), -1, 1),
+      fadeOutCurvature: clamp(toFinite(next.audio?.fadeOutCurvature, 0), -1, 1),
       outputDeviceId:
         typeof next.audio?.outputDeviceId === 'string' && next.audio.outputDeviceId
           ? next.audio.outputDeviceId
@@ -654,6 +729,16 @@ const normalizeTrack = (track, fallbackColor = '#5dd8c7') => {
       channelMapEnabled: Boolean(next.audio?.channelMapEnabled),
       channelMap: normalizeAudioChannelMap(next.audio?.channelMap, channels),
     };
+    const normalizedTrim = normalizeAudioTrimRange(
+      next.audio.duration,
+      next.audio?.trimIn,
+      next.audio?.trimOut
+    );
+    next.audio.trimIn = normalizedTrim.trimIn;
+    next.audio.trimOut = normalizedTrim.trimOut;
+    const clipDuration = Math.max(next.audio.trimOut - next.audio.trimIn, 0);
+    next.audio.fadeInDuration = clamp(next.audio.fadeInDuration, 0, clipDuration);
+    next.audio.fadeOutDuration = clamp(next.audio.fadeOutDuration, 0, clipDuration);
   }
   return next;
 };
@@ -929,6 +1014,8 @@ const createTrack = (index, view, kind = 'osc', options = {}) => {
         ? `MIDI CC ${String(index).padStart(2, '0')}`
       : kind === 'midi-note'
         ? `MIDI Note ${String(index).padStart(2, '0')}`
+      : kind === 'midi-pc'
+        ? `MIDI PC ${String(index).padStart(2, '0')}`
       : kind === 'osc-array'
         ? `OSC Array ${String(index).padStart(2, '0')}`
       : kind === 'osc-3d'
@@ -944,10 +1031,10 @@ const createTrack = (index, view, kind = 'osc', options = {}) => {
         : `Track ${String(index).padStart(2, '0')}`;
   const min = kind === 'osc-3d'
     ? DEFAULT_OSC_3D_TRACK_SETTINGS.bounds.yMin
-    : (kind === 'midi' || kind === 'midi-note' || kind === 'dmx' || kind === 'dmx-color' || kind === 'osc-color'
+    : (kind === 'midi' || kind === 'midi-note' || kind === 'midi-pc' || kind === 'dmx' || kind === 'dmx-color' || kind === 'osc-color'
       ? 0
       : 0);
-  const max = kind === 'midi' || kind === 'midi-note'
+  const max = kind === 'midi' || kind === 'midi-note' || kind === 'midi-pc'
     ? 127
     : (kind === 'osc-3d'
       ? DEFAULT_OSC_3D_TRACK_SETTINGS.bounds.yMax
@@ -958,7 +1045,7 @@ const createTrack = (index, view, kind = 'osc', options = {}) => {
       kind === 'group'
         ? 0
         : (
-      kind === 'midi' || kind === 'dmx' || kind === 'dmx-color' || kind === 'osc-color'
+      kind === 'midi' || kind === 'midi-pc' || kind === 'dmx' || kind === 'dmx-color' || kind === 'osc-color'
         ? 0
         : (
           kind === 'midi-note'
@@ -1069,6 +1156,32 @@ const createTrack = (index, view, kind = 'osc', options = {}) => {
           0,
           127
         ),
+      },
+    };
+  }
+  if (kind === 'midi-pc') {
+    const midiOptions = options.midi || {};
+    const program = clamp(
+      Math.round(toFinite(midiOptions.program, DEFAULT_MIDI_PC_TRACK_SETTINGS.program)),
+      0,
+      127
+    );
+    return {
+      ...base,
+      default: program,
+      midi: {
+        ...DEFAULT_MIDI_PC_TRACK_SETTINGS,
+        outputId:
+          typeof midiOptions.outputId === 'string' && midiOptions.outputId
+            ? midiOptions.outputId
+            : DEFAULT_MIDI_PC_TRACK_SETTINGS.outputId,
+        channel: clamp(
+          Math.round(toFinite(midiOptions.channel, DEFAULT_MIDI_PC_TRACK_SETTINGS.channel)),
+          1,
+          16
+        ),
+        mode: 'pc',
+        program,
       },
     };
   }
@@ -1935,7 +2048,7 @@ const reduceProjectState = (state, action) => {
           ...action.node,
           v: track.kind === 'osc-flag'
             ? toFinite(action.node?.v, 1)
-            : track.kind === 'midi'
+            : (track.kind === 'midi' || track.kind === 'midi-pc')
               ? normalizeMidiCcValue(action.node?.v, track.default)
             : (track.kind === 'dmx' || track.kind === 'dmx-color')
               ? normalizeDmxValue(action.node?.v, track.default)
@@ -1993,6 +2106,9 @@ const reduceProjectState = (state, action) => {
         if (track.kind === 'midi-note') {
           node.d = Math.max(toFinite(action.node?.d, 0.5), 0.01);
         }
+        if (track.kind === 'midi-pc') {
+          node.y = clamp(toFinite(action.node?.y, 0.5), 0, 1);
+        }
         return normalizeTrack({
           ...track,
           nodes: [...track.nodes, node],
@@ -2014,7 +2130,7 @@ const reduceProjectState = (state, action) => {
           t: Math.max(toFinite(node?.t, 0), 0),
           v: track.kind === 'osc-flag'
             ? toFinite(node?.v, 1)
-            : track.kind === 'midi'
+            : (track.kind === 'midi' || track.kind === 'midi-pc')
               ? normalizeMidiCcValue(node?.v, track.default)
             : (track.kind === 'dmx' || track.kind === 'dmx-color')
               ? normalizeDmxValue(node?.v, track.default)
@@ -2077,6 +2193,11 @@ const reduceProjectState = (state, action) => {
           ...(track.kind === 'midi-note'
             ? {
               d: Math.max(toFinite(node?.d, 0.5), 0.01),
+            }
+            : {}),
+          ...(track.kind === 'midi-pc'
+            ? {
+              y: clamp(toFinite(node?.y, 0.5), 0, 1),
             }
             : {}),
         }));

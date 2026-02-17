@@ -22,6 +22,7 @@ export default function TimelineHeader({
   loopEnd = 0,
   onLoopRangeChange,
   onLoopEdit,
+  showScroll = true,
 }) {
   const TIMELINE_HEADER_HEIGHT = 72;
   const TICK_TOP = 24;
@@ -489,15 +490,17 @@ export default function TimelineHeader({
           </button>
         </div>
       )}
-      <input
-        className="timeline-scroll"
-        type="range"
-        min="0"
-        max={Math.max(view.length - (view.end - view.start), 0)}
-        step="0.01"
-        value={view.start}
-        onChange={(event) => onScroll(Number(event.target.value))}
-      />
+      {showScroll && (
+        <input
+          className="timeline-scroll"
+          type="range"
+          min="0"
+          max={Math.max(view.length - (view.end - view.start), 0)}
+          step="0.01"
+          value={view.start}
+          onChange={(event) => onScroll(Number(event.target.value))}
+        />
+      )}
     </div>
   );
 }

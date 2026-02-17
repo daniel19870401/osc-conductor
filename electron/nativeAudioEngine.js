@@ -28,6 +28,73 @@ const normalizeText = (value) => (
 
 const clamp = (value, min, max) => Math.min(Math.max(value, min), max);
 
+const normalizeFadeShape = (value) => {
+  const next = typeof value === 'string' ? value.trim().toLowerCase() : 'linear';
+  if (
+    next === 'linear'
+    || next === 'ease-in'
+    || next === 'ease-out'
+    || next === 'ease-in-out'
+    || next === 's-curve'
+    || next === 'exp'
+    || next === 'log'
+  ) {
+    return next;
+  }
+  return 'linear';
+};
+
+const getCurvePower = (curvatureRaw) => {
+  const curvature = clamp(Number(curvatureRaw) || 0, -1, 1);
+  if (curvature >= 0) return 1 + curvature * 6;
+  return 1 / (1 + Math.abs(curvature) * 6);
+};
+
+const evalFadeCurve = (progressRaw, shapeRaw, curvatureRaw) => {
+  const progress = clamp(Number(progressRaw) || 0, 0, 1);
+  const shape = normalizeFadeShape(shapeRaw);
+  const power = getCurvePower(curvatureRaw);
+  switch (shape) {
+    case 'ease-in':
+      return Math.pow(progress, 2 * power);
+    case 'ease-out':
+      return 1 - Math.pow(1 - progress, 2 * power);
+    case 'ease-in-out':
+      if (progress <= 0.5) return 0.5 * Math.pow(progress * 2, 2 * power);
+      return 1 - 0.5 * Math.pow((1 - progress) * 2, 2 * power);
+    case 's-curve': {
+      return progress * progress * (3 - 2 * progress);
+    }
+    case 'exp':
+      return Math.pow(progress, power + 0.6);
+    case 'log':
+      return 1 - Math.pow(1 - progress, power + 0.6);
+    case 'linear':
+    default:
+      return Math.pow(progress, power);
+  }
+};
+
+const normalizeTrimRange = (durationRaw, trimInRaw, trimOutRaw) => {
+  const duration = Math.max(Number(durationRaw) || 0, 0);
+  if (duration <= 0) {
+    return { trimIn: 0, trimOut: 0, clipDuration: 0 };
+  }
+  const minSpan = Math.min(0.01, duration);
+  const trimIn = clamp(Number(trimInRaw) || 0, 0, duration);
+  const parsedTrimOut = Number(trimOutRaw);
+  const rawTrimOut = Number.isFinite(parsedTrimOut) && parsedTrimOut > 0 ? parsedTrimOut : duration;
+  let trimOut = clamp(rawTrimOut, 0, duration);
+  if (trimOut <= trimIn) {
+    trimOut = clamp(trimIn + minSpan, 0, duration);
+  }
+  return {
+    trimIn,
+    trimOut,
+    clipDuration: Math.max(trimOut - trimIn, 0),
+  };
+};
+
 const readFourCC = (buffer, offset) => buffer.toString('ascii', offset, offset + 4);
 
 const parseWavBuffer = (buffer) => {
@@ -363,12 +430,30 @@ class NativeAudioEngine {
         const value = Math.round(Number(mapRaw[index]) || fallback);
         return clamp(value, 1, this.outputChannels);
       });
+      const trim = normalizeTrimRange(
+        decoded.duration,
+        Number(item.trimIn),
+        Number(item.trimOut)
+      );
+      const fadeInDuration = clamp(Number(item.fadeInDuration) || 0, 0, trim.clipDuration);
+      const fadeOutDuration = clamp(Number(item.fadeOutDuration) || 0, 0, trim.clipDuration);
       prepared.push({
         id: item.id,
         volume: clamp(Number.isFinite(Number(item.volume)) ? Number(item.volume) : 1, 0, 2),
         enabled: Boolean(item.enabled),
         decoded,
         clipStartFrames: Math.max(Math.floor((Number(item.clipStart) || 0) * this.sampleRate), 0),
+        trimInSeconds: trim.trimIn,
+        trimOutSeconds: trim.trimOut,
+        clipDurationSeconds: trim.clipDuration,
+        fadeInEnabled: Boolean(item.fadeInEnabled),
+        fadeOutEnabled: Boolean(item.fadeOutEnabled),
+        fadeInDuration,
+        fadeOutDuration,
+        fadeInShape: normalizeFadeShape(item.fadeInShape),
+        fadeOutShape: normalizeFadeShape(item.fadeOutShape),
+        fadeInCurvature: clamp(Number(item.fadeInCurvature) || 0, -1, 1),
+        fadeOutCurvature: clamp(Number(item.fadeOutCurvature) || 0, -1, 1),
         sourceChannels,
         channelMap,
       });
@@ -402,10 +487,57 @@ class NativeAudioEngine {
       const nextClipStartFrames = Number.isFinite(Number(patch.clipStart))
         ? Math.max(Math.floor(Number(patch.clipStart) * this.sampleRate), 0)
         : track.clipStartFrames;
+      const trim = normalizeTrimRange(
+        track.decoded?.duration || 0,
+        Number.isFinite(Number(patch.trimIn)) ? Number(patch.trimIn) : track.trimInSeconds,
+        Number.isFinite(Number(patch.trimOut)) ? Number(patch.trimOut) : track.trimOutSeconds
+      );
+      const nextFadeInEnabled = typeof patch.fadeInEnabled === 'boolean'
+        ? patch.fadeInEnabled
+        : track.fadeInEnabled;
+      const nextFadeOutEnabled = typeof patch.fadeOutEnabled === 'boolean'
+        ? patch.fadeOutEnabled
+        : track.fadeOutEnabled;
+      const nextFadeInDuration = clamp(
+        Number.isFinite(Number(patch.fadeInDuration)) ? Number(patch.fadeInDuration) : track.fadeInDuration,
+        0,
+        trim.clipDuration
+      );
+      const nextFadeOutDuration = clamp(
+        Number.isFinite(Number(patch.fadeOutDuration)) ? Number(patch.fadeOutDuration) : track.fadeOutDuration,
+        0,
+        trim.clipDuration
+      );
+      const nextFadeInShape = normalizeFadeShape(
+        typeof patch.fadeInShape === 'string' ? patch.fadeInShape : track.fadeInShape
+      );
+      const nextFadeOutShape = normalizeFadeShape(
+        typeof patch.fadeOutShape === 'string' ? patch.fadeOutShape : track.fadeOutShape
+      );
+      const nextFadeInCurvature = clamp(
+        Number.isFinite(Number(patch.fadeInCurvature)) ? Number(patch.fadeInCurvature) : track.fadeInCurvature,
+        -1,
+        1
+      );
+      const nextFadeOutCurvature = clamp(
+        Number.isFinite(Number(patch.fadeOutCurvature)) ? Number(patch.fadeOutCurvature) : track.fadeOutCurvature,
+        -1,
+        1
+      );
       if (
         nextVolume === track.volume
         && nextEnabled === track.enabled
         && nextClipStartFrames === track.clipStartFrames
+        && trim.trimIn === track.trimInSeconds
+        && trim.trimOut === track.trimOutSeconds
+        && nextFadeInEnabled === track.fadeInEnabled
+        && nextFadeOutEnabled === track.fadeOutEnabled
+        && nextFadeInDuration === track.fadeInDuration
+        && nextFadeOutDuration === track.fadeOutDuration
+        && nextFadeInShape === track.fadeInShape
+        && nextFadeOutShape === track.fadeOutShape
+        && nextFadeInCurvature === track.fadeInCurvature
+        && nextFadeOutCurvature === track.fadeOutCurvature
       ) {
         return track;
       }
@@ -415,6 +547,17 @@ class NativeAudioEngine {
         volume: nextVolume,
         enabled: nextEnabled,
         clipStartFrames: nextClipStartFrames,
+        trimInSeconds: trim.trimIn,
+        trimOutSeconds: trim.trimOut,
+        clipDurationSeconds: trim.clipDuration,
+        fadeInEnabled: nextFadeInEnabled,
+        fadeOutEnabled: nextFadeOutEnabled,
+        fadeInDuration: nextFadeInDuration,
+        fadeOutDuration: nextFadeOutDuration,
+        fadeInShape: nextFadeInShape,
+        fadeOutShape: nextFadeOutShape,
+        fadeInCurvature: nextFadeInCurvature,
+        fadeOutCurvature: nextFadeOutCurvature,
       };
     });
     return { ok: true, updated };
@@ -435,16 +578,29 @@ class NativeAudioEngine {
         const track = this.trackStates[trackIndex];
         if (!track.enabled || !track.decoded) continue;
         const src = track.decoded;
-        const resampleRatio = src.sampleRate / this.sampleRate;
         const srcMaxFrame = Math.max(src.frameCount - 1, 0);
         for (let frame = 0; frame < frameCount; frame += 1) {
           const timelineFrame = this.playheadFrames + frame;
           const trackTimelineFrame = timelineFrame - track.clipStartFrames;
-          const srcPos = trackTimelineFrame * resampleRatio;
+          const trackTimelineSeconds = trackTimelineFrame / Math.max(this.sampleRate, 1);
+          if (trackTimelineSeconds < 0 || trackTimelineSeconds >= track.clipDurationSeconds) continue;
+          const srcPos = (track.trimInSeconds + trackTimelineSeconds) * src.sampleRate;
           if (srcPos < 0 || srcPos >= src.frameCount) continue;
           const base = Math.floor(srcPos);
           const next = Math.min(base + 1, srcMaxFrame);
           const frac = srcPos - base;
+          let fadeGain = 1;
+          if (track.fadeInEnabled && track.fadeInDuration > 0) {
+            const inProgress = clamp(trackTimelineSeconds / track.fadeInDuration, 0, 1);
+            fadeGain *= evalFadeCurve(inProgress, track.fadeInShape, track.fadeInCurvature);
+          }
+          if (track.fadeOutEnabled && track.fadeOutDuration > 0) {
+            const fromEnd = track.clipDurationSeconds - trackTimelineSeconds;
+            const outProgress = clamp(1 - fromEnd / track.fadeOutDuration, 0, 1);
+            fadeGain *= 1 - evalFadeCurve(outProgress, track.fadeOutShape, -(track.fadeOutCurvature || 0));
+          }
+          const gain = track.volume * clamp(fadeGain, 0, 1);
+          if (gain <= 0) continue;
           const outBase = frame * outChannels;
           for (let ch = 0; ch < track.sourceChannels; ch += 1) {
             const targetOut = (track.channelMap[ch] || (ch + 1)) - 1;
@@ -454,7 +610,7 @@ class NativeAudioEngine {
             const s0 = sourceBuffer[base] || 0;
             const s1 = sourceBuffer[next] || 0;
             const sample = s0 + (s1 - s0) * frac;
-            mixed[outBase + targetOut] += sample * track.volume;
+            mixed[outBase + targetOut] += sample * gain;
           }
         }
       }
